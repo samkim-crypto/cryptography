@@ -2105,8 +2105,9 @@ dependencies = [
  "ark-ff",
  "criterion",
  "light-poseidon",
- "num-bigint",
+ "num-bigint 0.4.6",
  "rand 0.10.2",
+ "solana-bn254-syscall",
 ]
 
 [[package]]
