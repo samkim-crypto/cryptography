@@ -43,6 +43,14 @@ impl Fq2 {
         (self.c0, self.c1)
     }
 
+    #[inline]
+    pub(crate) fn halve(&self) -> Self {
+        Self {
+            c0: B::halve(&self.c0),
+            c1: B::halve(&self.c1),
+        }
+    }
+
     /// Computes the square with two base-field multiplications.
     #[inline]
     pub fn square(&self) -> Self {
@@ -110,12 +118,6 @@ impl Mul for Fq2 {
     type Output = Self;
     #[inline]
     fn mul(self, rhs: Self) -> Self {
-        let a = B::mul(&self.c0, &rhs.c0);
-        let b = B::mul(&self.c1, &rhs.c1);
-        let cross = FqSum::new(&self.c0, &self.c1).product(FqSum::new(&rhs.c0, &rhs.c1));
-        Self {
-            c0: B::sub(&a, &b),
-            c1: B::sub(&B::sub(&cross, &a), &b),
-        }
+        super::portable::fq2_wide::mul(self, rhs)
     }
 }

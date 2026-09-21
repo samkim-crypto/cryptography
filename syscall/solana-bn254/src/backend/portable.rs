@@ -1,7 +1,9 @@
-//! Pure Rust multi-limb arithmetic fallback.
+//! Multi-limb arithmetic with an optional native Fq multiplication kernel.
 //!
 //! Provides a `MontgomeryBackend` using 64-bit limb arithmetic
-//! without assuming x86_64 intrinsics.
+//! with a portable fallback on targets without Linux x86_64 ADX/BMI2.
+//! The CIOS schedule follows Koc, Acar and Kaliski, Section 5:
+//! <https://www.microsoft.com/en-us/research/wp-content/uploads/1996/01/j37acmon.pdf>.
 
 use super::{Field, MontgomeryBackend, U256};
 use core::marker::PhantomData;
@@ -28,15 +30,45 @@ const fn mac(a: u64, b: u64, c: u64, carry: u64) -> (u64, u64) {
     (res as u64, (res >> 64) as u64)
 }
 
-/// A portable, pure-Rust backend for Montgomery arithmetic.
+/// Montgomery arithmetic with a portable fallback and optional native Fq kernel.
 pub struct PortableBackend<F: Field>(PhantomData<F>);
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    target_feature = "adx",
+    target_feature = "bmi2",
+))]
+mod adx;
 mod fq2_sum;
+pub(super) mod fq2_wide;
 mod inversion;
+mod square;
 
 pub(super) use fq2_sum::FqSum;
 
 impl<F: Field> PortableBackend<F> {
+    /// Divides a canonical Montgomery residue by two without multiplication.
+    /// As in Firedancer's `fd_bn254_fp_halve`, add q for odd inputs before shifting:
+    /// <https://github.com/firedancer-io/firedancer/blob/20c3fa1ff2dab737ec075c3e3e302ba778fd98fe/src/ballet/bn254/fd_bn254_field_inl.h#L225>.
+    /// Adding the odd modulus to odd inputs makes the integer numerator even.
+    /// The numerator is below 2p, so its half is canonical. Retain the high
+    /// carry as well, allowing any odd modulus fitting in 256 bits.
+    #[inline(always)]
+    pub(crate) fn halve(a: &U256) -> U256 {
+        let mask = 0u64.wrapping_sub(a.0[0] & 1);
+        let (r0, carry) = adc(a.0[0], F::MODULUS.0[0] & mask, 0);
+        let (r1, carry) = adc(a.0[1], F::MODULUS.0[1] & mask, carry);
+        let (r2, carry) = adc(a.0[2], F::MODULUS.0[2] & mask, carry);
+        let (r3, carry) = adc(a.0[3], F::MODULUS.0[3] & mask, carry);
+        U256::new([
+            (r0 >> 1) | (r1 << 63),
+            (r1 >> 1) | (r2 << 63),
+            (r2 >> 1) | (r3 << 63),
+            (r3 >> 1) | (carry << 63),
+        ])
+    }
+
     /// Inverts a canonical Montgomery residue, returning `None` for zero.
     ///
     /// For input `a = x * R mod p`, returns `x^-1 * R mod p`, fully reduced,
@@ -50,6 +82,16 @@ impl<F: Field> PortableBackend<F> {
     // separate proof permits Fq operands below 2q and retains canonical output.
     #[inline(always)]
     fn mul_cios(a: &U256, b: &U256) -> U256 {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_os = "linux",
+            target_feature = "adx",
+            target_feature = "bmi2",
+        ))]
+        if F::MODULUS == crate::backend::Fq::MODULUS {
+            return adx::mul(a, b);
+        }
+
         // Write p = MODULUS and W = 2^64. Each CIOS step is
         // t <- (t + a_i * b + m * p) / W, with a_i, m < W.
         // Starting at zero, this preserves t < b + p.
@@ -155,7 +197,11 @@ impl<F: Field> MontgomeryBackend<F> for PortableBackend<F> {
 
     #[inline(always)]
     fn sqr(a: &U256) -> U256 {
-        Self::mul(a, a)
+        if F::MODULUS == crate::backend::Fq::MODULUS {
+            square::square(a)
+        } else {
+            Self::mul(a, a)
+        }
     }
 
     #[inline(always)]
@@ -178,6 +224,51 @@ mod tests {
     use crate::backend::Fr;
 
     type B = PortableBackend<Fr>;
+
+    #[test]
+    fn halving_is_canonical_and_matches_field_division() {
+        use crate::backend::Fq;
+        use num_bigint::BigUint;
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
+        use std::{vec, vec::Vec};
+
+        fn check<F: Field>() {
+            let integer = |v: U256| {
+                BigUint::from_bytes_le(
+                    &v.0.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
+                )
+            };
+            let raw = |v: &BigUint| {
+                let limbs = v.to_u64_digits();
+                U256::new(core::array::from_fn(|i| limbs.get(i).copied().unwrap_or(0)))
+            };
+            let modulus = integer(F::MODULUS);
+            let inverse_two = (&modulus + BigUint::from(1u8)) >> 1;
+            let mut values = vec![
+                BigUint::from(0u8),
+                BigUint::from(1u8),
+                BigUint::from(2u8),
+                &modulus - BigUint::from(1u8),
+                &modulus - BigUint::from(2u8),
+            ];
+            for bit in 1..254 {
+                let power = BigUint::from(1u8) << bit;
+                values.push((&power - BigUint::from(1u8)) % &modulus);
+                values.push(power % &modulus);
+            }
+            let mut rng = StdRng::seed_from_u64(0x00a0_1254);
+            for _ in 0..512 {
+                values.push(integer(U256::new(rng.random())) % &modulus);
+            }
+            for value in values {
+                let actual = PortableBackend::<F>::halve(&raw(&value));
+                assert!(PortableBackend::<F>::is_reduced(&actual));
+                assert_eq!(integer(actual), value * &inverse_two % &modulus);
+            }
+        }
+        check::<Fq>();
+        check::<Fr>();
+    }
 
     /// `INV` must satisfy `INV * MODULUS == -1 (mod 2^64)`. Catches a
     /// transcription error in the Fr parameters that would otherwise only

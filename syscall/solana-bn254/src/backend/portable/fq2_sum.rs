@@ -22,6 +22,7 @@ impl FqSum {
     }
 
     /// Returns a canonical product, in the original Montgomery domain.
+    #[cfg(test)]
     #[inline(always)]
     pub(in crate::backend) fn product(self, rhs: Self) -> U256 {
         // q < 2^254, so 4q < R. For a,b < 2q, the CIOS invariant
