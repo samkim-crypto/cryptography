@@ -28,3 +28,7 @@ harness = false
 [[bench]]
 name = "poseidon_bench"
 harness = false
+
+[[bench]]
+name = "gt_bench"
+harness = false

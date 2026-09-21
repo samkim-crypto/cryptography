@@ -17,4 +17,4 @@ pub mod poseidon;
 #[cfg(test)]
 extern crate std;
 
-pub use curve::{g1, g2};
+pub use curve::{g1, g2, gt};
