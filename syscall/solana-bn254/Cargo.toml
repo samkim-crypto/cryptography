@@ -9,6 +9,8 @@ license = { workspace = true }
 exclude = ["scripts/*"]
 
 [features]
+# The comparison runner supplies the external Firedancer static library.
+firedancer-bench = []
 
 [dependencies]
 
@@ -20,6 +22,7 @@ ark-ec = { workspace = true }
 ark-bn254 = { workspace = true }
 light-poseidon = { workspace = true }
 num-bigint = { workspace = true }
+solana-bn254-syscall = { path = "../bn254-syscall" }
 
 [[bench]]
 name = "fq_bench"
@@ -30,5 +33,14 @@ name = "poseidon_bench"
 harness = false
 
 [[bench]]
+name = "pairing_bench"
+harness = false
+
+[[bench]]
 name = "gt_bench"
 harness = false
+
+[[bench]]
+name = "pairing_compare"
+harness = false
+required-features = ["firedancer-bench"]

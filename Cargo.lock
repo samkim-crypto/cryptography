@@ -2085,6 +2085,7 @@ dependencies = [
  "light-poseidon",
  "num-bigint",
  "rand 0.10.2",
+ "solana-bn254-syscall",
 ]
 
 [[package]]

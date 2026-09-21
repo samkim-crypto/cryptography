@@ -21,7 +21,7 @@ const BETA_SQUARED_MONT: U256 = U256::new([
 ]);
 
 // xi = 9+u; b = 3/xi; psi coefficients are xi^((q-1)/3), xi^((q-1)/2).
-const CURVE_B: Fq2 = Fq2 {
+pub(crate) const CURVE_B: Fq2 = Fq2 {
     c0: U256::new([
         0x3bf938e377b802a8,
         0x020b1b273633535d,
@@ -35,7 +35,7 @@ const CURVE_B: Fq2 = Fq2 {
         0x0141b9ce4a688d4d,
     ]),
 };
-const PSI_X: Fq2 = Fq2 {
+pub(crate) const PSI_X: Fq2 = Fq2 {
     c0: U256::new([
         0xb5773b104563ab30,
         0x347f91c8a9aa6454,
@@ -49,7 +49,7 @@ const PSI_X: Fq2 = Fq2 {
         0x26694fbb4e82ebc3,
     ]),
 };
-const PSI_Y: Fq2 = Fq2 {
+pub(crate) const PSI_Y: Fq2 = Fq2 {
     c0: U256::new([
         0xe4bbdd0c2936b629,
         0xbb30f162e133bacb,
@@ -63,7 +63,7 @@ const PSI_Y: Fq2 = Fq2 {
         0x2c87200285defecc,
     ]),
 };
-const BN_X: u64 = 4965661367192848881;
+pub(crate) const BN_X: u64 = 4965661367192848881;
 
 // Fixed signed chain for BN_X. Starting at P, each step doubles by the given
 // count and adds the indicated multiple of P. Preparing affine 3P costs one
@@ -255,7 +255,10 @@ impl Affine {
         // This uses one 63-bit multiplication on the full twist; it must not
         // assume subgroup membership. The cofactor condition is checked below.
         // See https://eprint.iacr.org/2022/348, Theorem 1 and Example 1.
-        let xp = self.mul_by_bn_x();
+        self.subgroup_relation(self.mul_by_bn_x())
+    }
+
+    fn subgroup_relation(&self, xp: Projective) -> bool {
         let mut lhs = xp;
         lhs.add_mixed(self);
         let mut image = xp.frobenius();
@@ -265,6 +268,69 @@ impl Affine {
         let mut rhs = image.frobenius();
         rhs.double();
         lhs.matches(&rhs)
+    }
+
+    /// Checks a bounded batch on the entire twist, sharing normalization of 3Q.
+    /// Uses Montgomery's trick with zero denominators skipped; compare Arkworks'
+    /// `serial_batch_inversion_and_mul`:
+    /// <https://github.com/arkworks-rs/algebra/blob/v0.5.0/ff/src/fields/mod.rs>.
+    /// Applying it to the subgroup check's 3Q precomputations is local to this code.
+    pub(crate) fn batch_in_correct_subgroup<const N: usize>(
+        points: &[&Self; N],
+        len: usize,
+    ) -> bool {
+        assert!(len <= N);
+        if len == 0 {
+            return true;
+        }
+        if len == 1 {
+            return points[0].is_in_correct_subgroup();
+        }
+        let mut triples = [Projective::IDENTITY; N];
+        let mut prefixes = [Fq2::ONE; N];
+        let mut product = Fq2::ONE;
+        for i in 0..len {
+            if points[i].is_identity() {
+                continue;
+            }
+            let mut triple = Projective::from_affine(points[i]);
+            triple.double();
+            triple.add_mixed(points[i]);
+            prefixes[i] = product;
+            if triple.z != Fq2::ZERO {
+                product = product * triple.z;
+            }
+            triples[i] = triple;
+        }
+        // Only nonzero denominators entered the product. A point whose 3Q
+        // is infinity is handled as identity, without assuming membership.
+        let mut inverse = if product == Fq2::ONE {
+            Fq2::ONE
+        } else {
+            product.inverse().expect("product of nonzero denominators")
+        };
+        for i in (0..len).rev() {
+            if points[i].is_identity() {
+                continue;
+            }
+            let p = triples[i];
+            let triple = if p.z == Fq2::ZERO {
+                Self::IDENTITY
+            } else {
+                let z_inverse = inverse * prefixes[i];
+                inverse = inverse * p.z;
+                let zz_inverse = z_inverse.square();
+                Self {
+                    x: p.x * zz_inverse,
+                    y: p.y * (zz_inverse * z_inverse),
+                }
+            };
+            let xp = points[i].mul_by_bn_x_with_triple(triple);
+            if !points[i].subgroup_relation(xp) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Multiplies by an ordinary 256-bit integer on the entire twist curve.
@@ -361,7 +427,10 @@ impl Affine {
         let mut triple = Projective::from_affine(self);
         triple.double();
         triple.add_mixed(self);
-        let triple = triple.to_affine();
+        self.mul_by_bn_x_with_triple(triple.to_affine())
+    }
+
+    fn mul_by_bn_x_with_triple(&self, triple: Self) -> Projective {
         let negative = -*self;
         let negative_triple = -triple;
         let mut result = Projective::from_affine(self);
@@ -1091,6 +1160,47 @@ mod tests {
                     assert_eq!(
                         affine(p).mul_scalar_checked(&scalar),
                         Some(affine(expected))
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn batch_subgroup_checks_match_full_order_oracle() {
+        let mut rng = StdRng::seed_from_u64(0x6261_7463_685f_6732);
+        let reference: [G2Affine; 32] = core::array::from_fn(|i| {
+            if i % 7 == 0 {
+                G2Affine::identity()
+            } else {
+                G2Affine::generator()
+                    .mul_bigint(rng.random::<[u64; 4]>())
+                    .into_affine()
+            }
+        });
+        let inputs = reference.map(affine);
+        let points = core::array::from_fn(|i| &inputs[i]);
+        for len in 0..=32 {
+            assert!(Affine::batch_in_correct_subgroup::<32>(&points, len));
+        }
+        assert!(Affine::batch_in_correct_subgroup::<0>(&[], 0));
+        let identities = [&Affine::IDENTITY; 32];
+        assert!(Affine::batch_in_correct_subgroup(&identities, 32));
+        for _ in 0..16 {
+            let arbitrary = on_curve(&mut rng);
+            let torsion = arbitrary.mul_bigint(Fr::MODULUS).into_affine();
+            assert!(!torsion.infinity);
+            for point in [arbitrary, torsion, (torsion + reference[1]).into_affine()] {
+                for position in [0, 15, 31] {
+                    let mut batch = reference;
+                    batch[position] = point;
+                    let expected = batch
+                        .iter()
+                        .all(|p| p.mul_bigint(Fr::MODULUS).into_affine().infinity);
+                    let inputs = batch.map(affine);
+                    let points = core::array::from_fn(|i| &inputs[i]);
+                    assert_eq!(
+                        Affine::batch_in_correct_subgroup::<32>(&points, 32),
+                        expected
                     );
                 }
             }

@@ -78,7 +78,30 @@ impl Fq12 {
             (self.c0 + self.c1).mul_by_01(&(*b0 + *b3), b4) - a - b,
         )
     }
+    /// Six-product multiplication of two 034 line values.
+    /// Same coefficient formulas as gnark-crypto v0.12.1 `Mul034By034`:
+    /// <https://github.com/Consensys/gnark-crypto/blob/v0.12.1/ecc/bn254/internal/fptower/e12_pairing.go>.
+    #[inline]
+    pub(crate) fn product_034(a: &[Fq2; 3], b: &[Fq2; 3]) -> [Fq2; 5] {
+        let x0 = a[0] * b[0];
+        let x3 = a[1] * b[1];
+        let x4 = a[2] * b[2];
+        let x04 = (a[0] + a[2]) * (b[0] + b[2]) - x0 - x4;
+        let x03 = (a[0] + a[1]) * (b[0] + b[1]) - x0 - x3;
+        let x34 = (a[1] + a[2]) * (b[1] + b[2]) - x3 - x4;
+        [x0 + super::fq6::mul_by_xi(x4), x3, x34, x03, x04]
+    }
 
+    /// Applies a product of two lines in 17 Fq2 multiplications.
+    /// See `MulBy01234` in the same gnark-crypto reference as `product_034`.
+    #[inline]
+    pub(crate) fn mul_by_01234(&self, b: &[Fq2; 5]) -> Self {
+        let c0 = Fq6::new(b[0], b[1], b[2]);
+        let c1 = Fq6::new(b[3], b[4], Fq2::ZERO);
+        let a = self.c0 * c0;
+        let d = self.c1.mul_by_01(&b[3], &b[4]);
+        Self::new(a + d.mul_by_v(), (self.c0 + self.c1) * (c0 + c1) - a - d)
+    }
 }
 
 impl Add for Fq12 {
