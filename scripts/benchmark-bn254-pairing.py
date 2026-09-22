@@ -92,6 +92,9 @@ def run(args):
         raise SystemExit("Run this command on the x86 Linux devserver through benchctl")
     root = Path(__file__).resolve().parent.parent
     os.chdir(root)
+    bench = getattr(args, "bench", "pairing_compare")
+    metadata_path = root / ("group-comparison-metadata.json" if bench == "group_compare"
+                            else "pairing-comparison-metadata.json")
     archive = args.archive.resolve()
     build = Path(os.environ["CARGO_TARGET_DIR"]).resolve() / "firedancer-pairing"
     build.mkdir(parents=True, exist_ok=False)
@@ -134,7 +137,7 @@ def run(args):
         "criterion_arguments": args.criterion_args,
         "smoke_test": args.test,
     }
-    (root / "pairing-comparison-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
     print(json.dumps(metadata, indent=2), flush=True)
     objects = []
     for name in source_metadata["sources"]:
@@ -147,7 +150,7 @@ def run(args):
         execute(["cargo", "test", "--locked", "-p", "solana-bn254", "--lib", "--tests"])
     command = [
         "cargo", "rustc", "--locked", "--profile", "bench", "-p", "solana-bn254",
-        "--features", "firedancer-bench", "--bench", "pairing_compare",
+        "--features", "firedancer-bench", "--bench", bench,
         "--message-format=json", "--", "-L", f"native={build}",
     ]
     metadata["cargo_command"] = command
@@ -158,7 +161,7 @@ def run(args):
             event = json.loads(line)
             if event.get("reason") == "compiler-message":
                 print(event["message"].get("rendered", ""), end="", flush=True)
-            if event.get("reason") == "compiler-artifact" and event.get("target", {}).get("name") == "pairing_compare":
+            if event.get("reason") == "compiler-artifact" and event.get("target", {}).get("name") == bench:
                 executable = event.get("executable") or executable
         if process.wait():
             raise SystemExit(process.returncode)
@@ -169,7 +172,7 @@ def run(args):
         criterion_args = criterion_args[1:]
     command = [executable, "--bench", *(["--test"] if args.test else []), *criterion_args]
     metadata["benchmark_command"] = command
-    (root / "pairing-comparison-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
     execute(command)
 
 
@@ -182,6 +185,7 @@ def main():
     remote = sub.add_parser("run", help="Build and benchmark inside the benchctl queue")
     remote.add_argument("--archive", type=Path, default=Path(DEFAULT_ARCHIVE))
     remote.add_argument("--cc", default="gcc")
+    remote.add_argument("--bench", choices=["pairing_compare", "group_compare"], default="pairing_compare")
     remote.add_argument("--test", action="store_true", help="Run crate tests and Criterion correctness smoke checks")
     remote.add_argument("criterion_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()

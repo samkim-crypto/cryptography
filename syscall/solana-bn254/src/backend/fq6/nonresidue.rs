@@ -3,7 +3,7 @@
 //! Inputs and outputs are canonical Montgomery residues with radix `2^256`.
 //! Only the private five-limb accumulator is unreduced; it is below `10q`.
 
-use crate::backend::{Field, Fq, Fq2, U256};
+use crate::backend::{portable::small_multiple::reduce, Field, Fq, Fq2, U256};
 
 const Q: [u64; 4] = Fq::MODULUS.0;
 
@@ -36,37 +36,6 @@ fn accumulate<const SUBTRACT: bool>(a: &U256, b: &U256) -> [u64; 5] {
     result
 }
 
-/// Reduces an integer `0 <= value < 10q`, returning a canonical residue.
-#[inline(always)]
-fn reduce(value: [u64; 5]) -> U256 {
-    // k=floor(value/(3B)), obtained from the top five bits. Since value<10q,
-    // k<=10. Writing value=3kB+s, 0<=s<3B, gives value-kq=s-kd in (-q,q).
-    // Thus a negative result needs exactly one add-back; no subtraction follows.
-    let estimate = ((value[4] << 4) | (value[3] >> 60)) / 3;
-    debug_assert!(estimate <= 10);
-    let mut result = [0; 4];
-    let mut carry = 0i128;
-    for (i, limb) in result.iter_mut().enumerate() {
-        // -10W <= wide < W, hence the signed carry is in -10..=0.
-        let wide = value[i] as i128 - estimate as i128 * Q[i] as i128 + carry;
-        *limb = wide as u64;
-        carry = wide >> 64;
-    }
-    let sign = value[4] as i128 + carry;
-    debug_assert!((-1..=0).contains(&sign));
-    if sign < 0 {
-        let mut carry = 0u128;
-        for (i, limb) in result.iter_mut().enumerate() {
-            let wide = *limb as u128 + Q[i] as u128 + carry;
-            *limb = wide as u64;
-            carry = wide >> 64;
-        }
-        // The low limbs represented 2^256 + remainder before this add-back.
-        debug_assert_eq!(carry, 1);
-    }
-    U256::new(result)
-}
-
 /// Multiplies a canonical Fq2 value by the cubic nonresidue `9+u`.
 #[inline]
 pub(crate) fn mul_by_xi(value: Fq2) -> Fq2 {
@@ -84,7 +53,7 @@ mod tests {
     use ark_bn254::Fq as ArkFq;
     use ark_ff::{BigInt, BigInteger, PrimeField};
     use num_bigint::BigUint;
-    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
     use std::vec;
 
     fn integer(value: U256) -> BigUint {
