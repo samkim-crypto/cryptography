@@ -44,3 +44,8 @@ harness = false
 name = "pairing_compare"
 harness = false
 required-features = ["firedancer-bench"]
+
+[[bench]]
+name = "group_compare"
+harness = false
+required-features = ["firedancer-bench"]

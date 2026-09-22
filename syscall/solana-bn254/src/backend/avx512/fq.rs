@@ -347,16 +347,32 @@ pub(crate) unsafe fn mul_fq2_6(
     use super::pack::{pack_8x, unpack_8x};
     use crate::backend::{Fq2, U256};
     let a0 = pack_8x(&core::array::from_fn(|i| {
-        if i < 6 { a[i].c0 } else { U256::zero() }
+        if i < 6 {
+            a[i].c0
+        } else {
+            U256::zero()
+        }
     }));
     let a1 = pack_8x(&core::array::from_fn(|i| {
-        if i < 6 { a[i].c1 } else { U256::zero() }
+        if i < 6 {
+            a[i].c1
+        } else {
+            U256::zero()
+        }
     }));
     let b0 = pack_8x(&core::array::from_fn(|i| {
-        if i < 6 { b[i].c0 } else { U256::zero() }
+        if i < 6 {
+            b[i].c0
+        } else {
+            U256::zero()
+        }
     }));
     let b1 = pack_8x(&core::array::from_fn(|i| {
-        if i < 6 { b[i].c1 } else { U256::zero() }
+        if i < 6 {
+            b[i].c1
+        } else {
+            U256::zero()
+        }
     }));
     let a_sum = add_unreduced(&a0, &a1);
     let b_sum = add_unreduced(&b0, &b1);
@@ -371,15 +387,183 @@ pub(crate) unsafe fn mul_fq2_6(
     })
 }
 
+// Private integer sum for immediate input to the packed multiplier. Canonical
+// a,b<q imply a+b<2q<2^255, so the four-limb addition cannot overflow. pack_8x
+// normalizes the radix-52 limbs, and mul_8x's existing <2q contract applies.
+// This value must never be returned as a canonical Fq2 coefficient.
+#[inline]
+fn sum_g2_coefficients(a: &crate::backend::U256, b: &crate::backend::U256) -> crate::backend::U256 {
+    use crate::backend::{Backend, Fq, MontgomeryBackend, U256};
+    type B = Backend<Fq>;
+    debug_assert!(B::is_reduced(a) && B::is_reduced(b));
+    let mut words = [0; 4];
+    let mut carry = 0u128;
+    for (i, word) in words.iter_mut().enumerate() {
+        let value = a.0[i] as u128 + b.0[i] as u128 + carry;
+        *word = value as u64;
+        carry = value >> 64;
+    }
+    debug_assert_eq!(carry, 0);
+    U256::new(words)
+}
+
+/// Two Fq2 squares and one independent Fq2 product, using seven of eight lanes.
+/// Input/output coefficients are canonical R=2^256 Montgomery Fq residues.
+///
+/// # Safety
+/// Requires AVX-512 F, DQ and IFMA on the executing CPU.
+#[inline]
+#[target_feature(enable = "avx512f,avx512ifma,avx512dq")]
+pub(crate) unsafe fn fq2_two_squares_and_product(
+    squares: [crate::backend::Fq2; 2],
+    a: crate::backend::Fq2,
+    b: crate::backend::Fq2,
+) -> [crate::backend::Fq2; 3] {
+    use super::pack::{pack_8x, unpack_8x};
+    use crate::backend::{Backend, Fq, Fq2, MontgomeryBackend, U256};
+    type B = Backend<Fq>;
+    let [x, y] = squares;
+    let lhs = [
+        sum_g2_coefficients(&x.c0, &x.c1),
+        x.c0,
+        sum_g2_coefficients(&y.c0, &y.c1),
+        y.c0,
+        a.c0,
+        a.c1,
+        sum_g2_coefficients(&a.c0, &a.c1),
+        U256::zero(),
+    ];
+    let rhs = [
+        B::sub(&x.c0, &x.c1),
+        x.c1,
+        B::sub(&y.c0, &y.c1),
+        y.c1,
+        b.c0,
+        b.c1,
+        sum_g2_coefficients(&b.c0, &b.c1),
+        U256::zero(),
+    ];
+    let p = unpack_8x(&mul_8x(&pack_8x(&lhs), &pack_8x(&rhs)));
+    [
+        Fq2 {
+            c0: p[0],
+            c1: B::add(&p[1], &p[1]),
+        },
+        Fq2 {
+            c0: p[2],
+            c1: B::add(&p[3], &p[3]),
+        },
+        Fq2 {
+            c0: B::sub(&p[4], &p[5]),
+            c1: B::sub(&B::sub(&p[6], &p[4]), &p[5]),
+        },
+    ]
+}
+
+/// Three independent Fq2 squares, using six of eight lanes.
+/// Input/output coefficients are canonical R=2^256 Montgomery Fq residues.
+///
+/// # Safety
+/// Requires AVX-512 F, DQ and IFMA on the executing CPU.
+#[inline]
+#[target_feature(enable = "avx512f,avx512ifma,avx512dq")]
+pub(crate) unsafe fn fq2_three_squares(
+    values: [crate::backend::Fq2; 3],
+) -> [crate::backend::Fq2; 3] {
+    use super::pack::{pack_8x, unpack_8x};
+    use crate::backend::{Backend, Fq, Fq2, MontgomeryBackend, U256};
+    type B = Backend<Fq>;
+    let lhs = core::array::from_fn(|i| {
+        if i >= 6 {
+            return U256::zero();
+        }
+        let x = values[i / 2];
+        if i % 2 == 0 {
+            sum_g2_coefficients(&x.c0, &x.c1)
+        } else {
+            x.c0
+        }
+    });
+    let rhs = core::array::from_fn(|i| {
+        if i >= 6 {
+            return U256::zero();
+        }
+        let x = values[i / 2];
+        if i % 2 == 0 {
+            B::sub(&x.c0, &x.c1)
+        } else {
+            x.c1
+        }
+    });
+    let p = unpack_8x(&mul_8x(&pack_8x(&lhs), &pack_8x(&rhs)));
+    core::array::from_fn(|i| Fq2 {
+        c0: p[2 * i],
+        c1: B::add(&p[2 * i + 1], &p[2 * i + 1]),
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn packed_g2_formula_products_match_arkworks() {
+        let inv = ArkFq2::new(
+            ArkFq::from(2u64).pow([256u64]).inverse().unwrap(),
+            ArkFq::ZERO,
+        );
+        let check = |values: [Fq2; 4]| {
+            let ark = |x: Fq2| ArkFq2::new(field(x.c0), field(x.c1));
+            let raw_pair = |x: ArkFq2| Fq2 {
+                c0: raw(x.c0),
+                c1: raw(x.c1),
+            };
+            let mixed = unsafe {
+                fq2_two_squares_and_product([values[0], values[1]], values[2], values[3])
+            };
+            assert_eq!(
+                mixed,
+                [
+                    raw_pair(ark(values[0]).square() * inv),
+                    raw_pair(ark(values[1]).square() * inv),
+                    raw_pair(ark(values[2]) * ark(values[3]) * inv),
+                ]
+            );
+            let squares = unsafe { fq2_three_squares([values[0], values[1], values[2]]) };
+            for i in 0..3 {
+                assert_eq!(squares[i], raw_pair(ark(values[i]).square() * inv));
+            }
+        };
+        let one = ArkFq::ONE;
+        let mut values = vec![raw(ArkFq::ZERO), raw(one), raw(-one), raw(-one - one)];
+        for bit in [
+            1, 51, 52, 53, 103, 104, 105, 155, 156, 157, 207, 208, 209, 252, 253,
+        ] {
+            let power = ArkFq::from(2u64).pow([bit]);
+            values.extend([raw(power - one), raw(power), raw(power + one)]);
+        }
+        for i in 0..values.len() {
+            for j in 0..values.len() {
+                check(core::array::from_fn(|k| Fq2 {
+                    c0: values[(i + k) % values.len()],
+                    c1: values[(j + 3 * k) % values.len()],
+                }));
+            }
+        }
+        let mut rng = StdRng::seed_from_u64(0x6732_5f69_666d_616b);
+        for _ in 0..1024 {
+            check(core::array::from_fn(|_| Fq2 {
+                c0: random(&mut rng),
+                c1: random(&mut rng),
+            }));
+        }
+    }
+
     extern crate std;
     use super::super::pack::{pack_8x, unpack_8x};
     use super::*;
     use crate::backend::{Fq2, U256};
     use ark_bn254::{Fq as ArkFq, Fq2 as ArkFq2};
     use ark_ff::{AdditiveGroup as _, BigInt, Field as _, PrimeField};
-    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
     use std::vec;
 
     fn field(v: U256) -> ArkFq {

@@ -43,6 +43,7 @@ mod adx;
 mod fq2_sum;
 pub(super) mod fq2_wide;
 mod inversion;
+pub(crate) mod small_multiple;
 mod square;
 
 pub(super) use fq2_sum::FqSum;
@@ -229,7 +230,7 @@ mod tests {
     fn halving_is_canonical_and_matches_field_division() {
         use crate::backend::Fq;
         use num_bigint::BigUint;
-        use rand::{RngExt, SeedableRng, rngs::StdRng};
+        use rand::{rngs::StdRng, RngExt, SeedableRng};
         use std::{vec, vec::Vec};
 
         fn check<F: Field>() {

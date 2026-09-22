@@ -73,9 +73,9 @@ impl SplitScalar {
     }
 
     /// Prepares a signed schedule only when its estimated cost beats binary.
-    /// The two callers retain weights 7/11 (G1) and 17/30 (G2), with 100 for
-    /// table setup. These are latency heuristics, not execution-time bounds.
-    pub(super) fn prepare<const DOUBLING: u32, const ADDITION: u32>(
+    /// Each group supplies doubling, addition and common-denominator table
+    /// setup weights. These are latency heuristics, not execution-time bounds.
+    pub(super) fn prepare<const DOUBLING: u32, const ADDITION: u32, const SETUP: u32>(
         &self,
         scalar: &U256,
     ) -> Option<JointDigits> {
@@ -92,7 +92,7 @@ impl SplitScalar {
         let joint = self.k1 | self.k2;
         // Signed digits cannot reduce the number of positions below the
         // magnitudes' bit length. Reject on this bound before recoding.
-        if joint == 0 || DOUBLING * (127 - joint.leading_zeros()) + 100 >= binary_cost {
+        if joint == 0 || DOUBLING * (127 - joint.leading_zeros()) + SETUP >= binary_cost {
             return None;
         }
         let digits = self.joint_digits();
@@ -102,11 +102,58 @@ impl SplitScalar {
             .filter(|&&digit| digit != 0)
             .count() as u32;
         // Counts are at most 128; for the fixed weights both costs fit u32.
-        let signed_cost = DOUBLING * (digits.len as u32 - 1) + ADDITION * (nonzero - 1) + 100;
+        let signed_cost = DOUBLING * (digits.len as u32 - 1) + ADDITION * (nonzero - 1) + SETUP;
         (signed_cost < binary_cost).then_some(digits)
     }
 }
 
+// Fixed-constant Comba multiplication, as used by Firedancer's GLV helpers:
+// https://github.com/firedancer-io/firedancer/blob/20c3fa1ff2dab737ec075c3e3e302ba778fd98fe/src/ballet/bn254/fd_bn254_glv.h
+// The constant's limb sum is strictly below W=2^64. Each column plus its
+// incoming carry is at most (W-1)*sum(b) + (W-1) < W^2, so u128 is sufficient.
+// M is the proven input width; low columns still propagate every carry into
+// the high half, even when the caller only needs that high half.
+const fn limb_sum<const N: usize>(b: &[u64; N]) -> u128 {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < N {
+        sum += b[i] as u128;
+        i += 1;
+    }
+    sum
+}
+
+const _: () = {
+    assert!(limb_sum(&A) < 1u128 << 64);
+    assert!(limb_sum(&B) < 1u128 << 64);
+    assert!(limb_sum(&C) < 1u128 << 64);
+    assert!(limb_sum(&G1) < 1u128 << 64);
+    assert!(limb_sum(&G2) < 1u128 << 64);
+};
+
+#[cfg(any(test, all(target_arch = "x86_64", not(target_feature = "bmi2"))))]
+#[inline(always)]
+fn mul_fixed<const M: usize, const N: usize>(a: &U256, b: &[u64; N]) -> [u64; 8] {
+    assert!(M > 0 && M <= 4 && N > 0 && N <= 3);
+    debug_assert!(a.0[M..].iter().all(|&limb| limb == 0));
+    debug_assert!(limb_sum(b) < 1u128 << 64);
+    let mut out = [0; 8];
+    let mut carry = 0;
+    for column in 0..M + N - 1 {
+        let mut sum = carry;
+        for j in 0..N {
+            if j <= column && column - j < M {
+                sum += (a.0[column - j] as u128) * (b[j] as u128);
+            }
+        }
+        out[column] = sum as u64;
+        carry = sum >> 64;
+    }
+    out[M + N - 1] = carry as u64;
+    out
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", not(target_feature = "bmi2")))))]
 /// Full unsigned product, retaining every carry. N is at most four.
 #[inline(always)]
 fn mul_wide<const N: usize>(a: &U256, b: &[u64; N]) -> [u64; 8] {
@@ -124,6 +171,20 @@ fn mul_wide<const N: usize>(a: &U256, b: &[u64; N]) -> [u64; 8] {
         out[i + 4] = carry;
     }
     out
+}
+
+// The bounded Comba schedule improved generic-x86 complete calls. Native
+// BMI2 builds retain the original schedule after the measured G05A regression.
+#[inline(always)]
+fn product_fixed<const M: usize, const N: usize>(a: &U256, b: &[u64; N]) -> [u64; 8] {
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "bmi2")))]
+    {
+        mul_fixed::<M, N>(a, b)
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(target_feature = "bmi2"))))]
+    {
+        mul_wide(a, b)
+    }
 }
 
 #[inline(always)]
@@ -167,22 +228,25 @@ fn narrow(value: U256) -> u128 {
 /// Returns k1 + signed(k2)*lambda = scalar (mod r), for all scalar < 2^256.
 #[inline(always)]
 pub(super) fn decompose(scalar: &U256) -> SplitScalar {
-    let product = mul_wide(scalar, &G1);
+    let product = product_fixed::<4, 3>(scalar, &G1);
     let b1 = U256::new([product[4], product[5], product[6], product[7]]);
-    let product = mul_wide(scalar, &G2);
+    let product = product_fixed::<4, 2>(scalar, &G2);
     let b2 = U256::new([product[4], product[5], product[6], product[7]]);
 
     // Put d1=scalar*C/r-b1 and d2=scalar*B/r-b2. Rounding both reciprocals
     // down and scalar<R imply 0<=d1,d2<2. Then k1=A*d1+B*d2 is in [0,2C),
     // and k2=-B*d1+C*d2 is in (-2B,2C). Since 2C<2^128, both magnitudes fit.
     // Also b1*A+b2*B<=scalar, so that sum fits 256 bits without a carry.
-    let lattice_x = add_integer(&low_u256(mul_wide(&b1, &A)), &low_u256(mul_wide(&b2, &B)));
+    let lattice_x = add_integer(
+        &low_u256(product_fixed::<3, 2>(&b1, &A)),
+        &low_u256(product_fixed::<2, 1>(&b2, &B)),
+    );
     let (k1, borrow) = sub_integer(scalar, &lattice_x);
     debug_assert!(!borrow);
 
     // b1<2^130, b2<2^66, B<2^64 and C<2^127: each product fits 256 bits.
-    let positive = low_u256(mul_wide(&b1, &B));
-    let negative = low_u256(mul_wide(&b2, &C));
+    let positive = low_u256(product_fixed::<3, 1>(&b1, &B));
+    let negative = low_u256(product_fixed::<2, 2>(&b2, &C));
     let (difference, k2_negative) = sub_integer(&positive, &negative);
     let magnitude = if k2_negative {
         sub_integer(&negative, &positive).0
@@ -201,11 +265,11 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use ark_bn254::{Fr, g1::Config};
+    use ark_bn254::{g1::Config, Fr};
     use ark_ec::scalar_mul::glv::GLVConfig;
     use ark_ff::PrimeField;
     use num_bigint::{BigInt, BigUint};
-    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
     use std::vec::Vec;
 
     fn big(limbs: &[u64]) -> BigUint {
@@ -351,6 +415,32 @@ mod tests {
             check_product(a, rng.random::<[u64; 2]>());
             check_product(a, rng.random::<[u64; 3]>());
             check_product(a, rng.random::<[u64; 4]>());
+        }
+    }
+
+    #[test]
+    fn fixed_products_match_integer_oracle_at_each_input_width() {
+        fn check<const M: usize, const N: usize>(a: U256, b: [u64; N]) {
+            assert_eq!(big(&mul_fixed::<M, N>(&a, &b)), big(&a.0) * big(&b));
+        }
+        let mut rng = StdRng::seed_from_u64(0x676c_765f_6669_7865);
+        let boundary = [
+            U256::zero(),
+            U256::new([u64::MAX; 4]),
+            U256::new([0, 0, 0, 1 << 63]),
+        ];
+        for a in boundary
+            .into_iter()
+            .chain((0..4096).map(|_| U256::new(rng.random())))
+        {
+            check::<4, 3>(a, G1);
+            check::<4, 2>(a, G2);
+            let a3 = U256::new([a.0[0], a.0[1], a.0[2], 0]);
+            let a2 = U256::new([a.0[0], a.0[1], 0, 0]);
+            check::<3, 2>(a3, A);
+            check::<3, 1>(a3, B);
+            check::<2, 1>(a2, B);
+            check::<2, 2>(a2, C);
         }
     }
 

@@ -20,19 +20,37 @@ struct Signed {
 #[inline(always)]
 fn divsteps(mut delta: i32, mut f: u64, mut g: u64) -> (i32, [[i64; 2]; 2]) {
     let (mut u, mut v, mut q, mut r) = (1i64, 0i64, 0i64, 1i64);
-    for _ in 0..STEPS {
-        if delta > 0 && g & 1 != 0 {
+    let mut remaining = STEPS;
+    while remaining != 0 {
+        // Consecutive even-g divsteps leave f and the second matrix row
+        // unchanged. Combine their shifts and first-row scalings. This is the
+        // run-skipping optimization described in libsecp256k1's safegcd notes,
+        // section 6: https://github.com/bitcoin-core/secp256k1/blob/master/doc/safegcd_implementation.md
+        // Cap at the batch boundary, including g=0 (trailing_zeros returns 64).
+        // At most 62 steps have occurred, so scaled row norms remain <=2^62.
+        let zeros = g.trailing_zeros().min(remaining);
+        if zeros != 0 {
+            g >>= zeros;
+            let scale = 1i64 << zeros;
+            u *= scale;
+            v *= scale;
+            delta += zeros as i32;
+            remaining -= zeros;
+            if remaining == 0 {
+                break;
+            }
+        }
+        debug_assert_eq!(g & 1, 1);
+        remaining -= 1;
+        if delta > 0 {
             delta = 1 - delta;
             (f, g) = (g, g.wrapping_sub(f) >> 1);
             (u, v, q, r) = (2 * q, 2 * r, q - u, r - v);
         } else {
             delta += 1;
-            if g & 1 != 0 {
-                g = g.wrapping_add(f);
-                q += u;
-                r += v;
-            }
-            g >>= 1;
+            g = g.wrapping_add(f) >> 1;
+            q += u;
+            r += v;
             u *= 2;
             v *= 2;
         }
@@ -192,13 +210,23 @@ mod tests {
     #[test]
     fn batches_match_full_integer_divsteps() {
         let mut rng = StdRng::seed_from_u64(0x6469_7673_7465_7073);
-        for _ in 0..256 {
+        // Exercise every trailing-zero count and batches with an all-zero low
+        // word, alongside random inputs. The oracle still executes individual
+        // divsteps over signed arbitrary-precision integers.
+        let inputs = core::iter::once(U256::zero())
+            .chain((0..256).map(|bit| {
+                let mut value = U256::zero();
+                value.0[bit / 64] = 1u64 << (bit % 64);
+                value
+            }))
+            .chain((0..256).map(|_| U256::new(rng.random())));
+        for input in inputs {
             let mut f = Signed {
                 limbs: FullWidth::MODULUS,
                 high: 0,
             };
             let mut g = Signed {
-                limbs: U256::new(rng.random()),
+                limbs: input,
                 high: 0,
             };
             let mut delta = 1;

@@ -11,6 +11,9 @@ use super::glv;
 
 type B = Backend<Fq>;
 
+const GLV_WINDOW_WIDTH: u32 = 4;
+const GLV_WINDOW_TABLE_SIZE: usize = 1 << (GLV_WINDOW_WIDTH - 2);
+
 // 2^256 mod q: the Montgomery representation of one.
 const ONE: U256 = U256::new([
     0xd35d438dc58f0d9d,
@@ -162,18 +165,43 @@ impl Affine {
         } else {
             (scalar, false)
         };
+        // Centering also exposes r and r±1. Return their trivial results
+        // before entering a scalar loop, preserving the representative's sign.
+        match scalar.0 {
+            [0, 0, 0, 0] => return Self::IDENTITY,
+            [1, 0, 0, 0] => return if negative { -*self } else { *self },
+            _ => {}
+        }
         // Small magnitudes avoid recoding and table setup. Larger magnitudes,
         // including raw 128-bit inputs, compare the actual signed schedule.
         if scalar.0[1] != 0 || scalar.0[2] != 0 || scalar.0[3] != 0 {
             let split = glv::decompose(scalar);
-            if let Some(digits) = split.prepare::<7, 11>(scalar) {
+            // Dense inputs of at least 96 bits can amortize an odd-multiple
+            // table. Keep the existing selector for shorter/sparse integers.
+            if (scalar.0[3] | scalar.0[2] | (scalar.0[1] >> 31)) != 0
+                && scalar.0.iter().map(|word| word.count_ones()).sum::<u32>() > 32
+            {
+                // Wider tables paid off on long dense inputs in G07, while
+                // width 4 retained the better shorter-input setup cost.
+                let windowed = if scalar.0[3] != 0 {
+                    self.mul_glv_window::<5, 8>(&split)
+                } else {
+                    self.mul_glv_window::<GLV_WINDOW_WIDTH, GLV_WINDOW_TABLE_SIZE>(&split)
+                };
+                if let Some(result) = windowed {
+                    return if negative { -result } else { result };
+                }
+            }
+            if let Some(digits) = split.prepare::<7, 11, 40>(scalar) {
                 let result = self.mul_glv(&digits);
                 return if negative { -result } else { result };
             }
         }
         let mut result = Projective::IDENTITY;
         let mut started = false;
-        for limb in scalar.0.iter().rev() {
+        // Skip whole zero limbs for short public integers. The existing
+        // started flag still skips leading zero bits in the highest limb.
+        for limb in scalar.0.iter().rev().skip_while(|&&word| word == 0) {
             for bit in (0..64).rev() {
                 let set = limb & (1u64 << bit) != 0;
                 if started {
@@ -188,7 +216,11 @@ impl Affine {
             }
         }
         let result = result.to_affine();
-        if negative { -result } else { result }
+        if negative {
+            -result
+        } else {
+            result
+        }
     }
 
     // Joint signed multiplication, including all table work in this call.
@@ -198,18 +230,52 @@ impl Affine {
             x: B::mul(&self.x, &glv::BETA_MONT),
             y: self.y,
         };
-        // P + phi(P) = -phi^2(P); this entry needs no inversion.
-        let combined = Self {
-            x: B::neg(&B::add(&self.x, &image.x)),
-            y: B::neg(&self.y),
+        // Give all four entries the common denominator H=phi(P).x-P.x.
+        // Their numerators lie on the isomorphic a=0 curve with coefficient
+        // b*H^6. The addition/doubling formulas need no b, so they can use
+        // these private temporaries directly. Fold H into the final Z before
+        // returning to the original curve. Related global-Z table technique:
+        // https://github.com/bitcoin-core/secp256k1/blob/master/src/ecmult_impl.h
+        let h = B::sub(&image.x, &self.x);
+        let (table, denominator) = if h == U256::zero() {
+            let combined = Self {
+                x: B::neg(&B::add(&self.x, &image.x)),
+                y: B::neg(&self.y),
+            };
+            ([*self, image + -*self, image, combined], ONE)
+        } else {
+            let hh = B::sqr(&h);
+            let x = B::mul(&self.x, &hh);
+            let image_x = B::mul(&image.x, &hh);
+            let y = B::mul(&self.y, &B::mul(&hh, &h));
+            let r = twice(&self.y);
+            let difference_x = B::sub(&B::sub(&B::sqr(&r), &x), &image_x);
+            let difference_y = B::add(&B::mul(&r, &B::sub(&x, &difference_x)), &y);
+            (
+                [
+                    Self { x, y },
+                    Self {
+                        x: difference_x,
+                        y: difference_y,
+                    },
+                    Self { x: image_x, y },
+                    Self {
+                        x: B::neg(&B::add(&x, &image_x)),
+                        y: B::neg(&y),
+                    },
+                ],
+                h,
+            )
         };
         // Positive indices 1..=4 encode P, phi(P)-P, phi(P), P+phi(P).
-        // Existing affine addition handles every exceptional difference.
-        let table = [*self, image + -*self, image, combined];
         let (last, rest) = digits.as_slice().split_last().expect("nonzero GLV scalar");
         let select = |digit: i8| {
             let point = table[usize::from(digit.unsigned_abs()) - 1];
-            if digit < 0 { -point } else { point }
+            if digit < 0 {
+                -point
+            } else {
+                point
+            }
         };
         let mut result = Projective::from_affine(&select(*last));
         for &digit in rest.iter().rev() {
@@ -218,6 +284,7 @@ impl Affine {
                 result.add_mixed(&select(digit));
             }
         }
+        result.z = B::mul(&result.z, &denominator);
         result.to_affine()
     }
 }
@@ -361,8 +428,186 @@ impl Projective {
     }
 }
 
+impl Affine {
+    // Entries are numerators on an isomorphic a=0 curve. Their common
+    // denominator must be multiplied into the final Jacobian Z before any
+    // point is returned through the public API. No subgroup assumption here.
+    // Related global-Z table construction:
+    // https://github.com/bitcoin-core/secp256k1/blob/master/src/ecmult_impl.h
+    fn odd_table<const N: usize>(&self) -> Option<([Self; N], U256)> {
+        assert!(N > 0);
+        if self.is_identity() {
+            return None;
+        }
+        let mut double = Projective::from_affine(self);
+        double.double();
+        let c = double.z;
+        if c == U256::zero() {
+            return None;
+        }
+        // On the isomorphic curve with coefficient b*C^6, 2P has affine
+        // coordinates (double.x,double.y). Repeated mixed addition avoids
+        // inverting C; this construction does not use subgroup eigenvalues.
+        let cc = B::sqr(&c);
+        let ccc = B::mul(&cc, &c);
+        let step = Self {
+            x: double.x,
+            y: double.y,
+        };
+        let mut current = Projective {
+            x: B::mul(&self.x, &cc),
+            y: B::mul(&self.y, &ccc),
+            z: ONE,
+        };
+        let mut points = [Projective::IDENTITY; N];
+        points[0] = current;
+        for point in &mut points[1..] {
+            current.add_mixed(&step);
+            *point = current;
+        }
+        let (table, d) = Projective::common_denominator(&points);
+        Some((table, B::mul(&c, &d)))
+    }
+
+    // Ordinary width-W NAF for both signed GLV components. Table preparation
+    // and the final denominator correction are included in every call.
+    fn mul_glv_window<const W: u32, const N: usize>(
+        &self,
+        split: &glv::SplitScalar,
+    ) -> Option<Self> {
+        assert!((3..=5).contains(&W) && N == 1usize << (W - 2));
+        if self.is_identity() || split.k1 | split.k2 == 0 {
+            return Some(Self::IDENTITY);
+        }
+        let left = super::window::from_u128::<W>(split.k1);
+        let right = super::window::from_u128::<W>(split.k2);
+        let (table, denominator) = self.odd_table::<N>()?;
+        // The x-only endomorphism commutes with this common scaling. Unlike
+        // Frobenius, it does not conjugate a possible Fq2 denominator.
+        let images = if split.k2 == 0 {
+            [Self::IDENTITY; N]
+        } else {
+            table.map(|p| {
+                let image = Self {
+                    x: B::mul(&p.x, &glv::BETA_MONT),
+                    y: p.y,
+                };
+                if split.k2_negative {
+                    -image
+                } else {
+                    image
+                }
+            })
+        };
+        let select = |entries: &[Self; N], digit: i8| {
+            let point = entries[usize::from(digit.unsigned_abs()) / 2];
+            if digit < 0 {
+                -point
+            } else {
+                point
+            }
+        };
+        let mut result = Projective::IDENTITY;
+        for i in (0..left.len.max(right.len)).rev() {
+            result.double();
+            if left.digits[i] != 0 {
+                result.add_mixed(&select(&table, left.digits[i]));
+            }
+            if right.digits[i] != 0 {
+                result.add_mixed(&select(&images, right.digits[i]));
+            }
+        }
+        result.z = B::mul(&result.z, &denominator);
+        Some(result.to_affine())
+    }
+}
+
+impl Projective {
+    // Return private affine numerators sharing D=product(nonzero Z_i).
+    // Prefix/suffix products form D/Z_i without an inverse; identity entries
+    // are skipped. Outputs are for the isomorphic curve with coefficient b*D^6.
+    fn common_denominator<const N: usize>(points: &[Self; N]) -> ([Affine; N], U256) {
+        let mut prefix = [ONE; N];
+        let mut denominator = ONE;
+        for (i, point) in points.iter().enumerate() {
+            prefix[i] = denominator;
+            if point.z != U256::zero() {
+                denominator = B::mul(&denominator, &point.z);
+            }
+        }
+        let mut suffix = ONE;
+        let mut table = [Affine::IDENTITY; N];
+        for i in (0..N).rev() {
+            let point = points[i];
+            if point.z == U256::zero() {
+                continue;
+            }
+            let factor = B::mul(&prefix[i], &suffix);
+            suffix = B::mul(&suffix, &point.z);
+            let square = B::sqr(&factor);
+            let cube = B::mul(&square, &factor);
+            table[i] = Affine {
+                x: B::mul(&point.x, &square),
+                y: B::mul(&point.y, &cube),
+            };
+        }
+        (table, denominator)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn odd_tables_match_independent_odd_multiples() {
+        use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+        fn check<const N: usize>(p: G1Affine) {
+            let radix = ArkFq::from(2u64).pow([256u64]);
+            let ours = |q: G1Affine| {
+                if q.infinity {
+                    Affine::IDENTITY
+                } else {
+                    let raw = |v: ArkFq| U256::new((v * radix).into_bigint().0);
+                    Affine::from_montgomery(raw(q.x), raw(q.y)).unwrap()
+                }
+            };
+            if p.infinity {
+                assert!(ours(p).odd_table::<N>().is_none());
+                return;
+            }
+            let (entries, denominator) = ours(p).odd_table::<N>().unwrap();
+            assert_ne!(denominator, U256::zero());
+            for (i, entry) in entries.into_iter().enumerate() {
+                let actual = if entry.is_identity() {
+                    Affine::IDENTITY
+                } else {
+                    Projective {
+                        x: entry.x,
+                        y: entry.y,
+                        z: denominator,
+                    }
+                    .to_affine()
+                };
+                let expected = p.mul_bigint([(2 * i + 1) as u64]).into_affine();
+                assert_eq!(actual, ours(expected));
+            }
+        }
+        let mut rng = StdRng::seed_from_u64(0x6731_5f6f_6464_7462);
+        for i in 0..19 {
+            let p = match i {
+                0 => G1Affine::identity(),
+                1 => G1Affine::generator(),
+                2 => -G1Affine::generator(),
+                _ => G1Affine::generator()
+                    .mul_bigint(rng.random::<[u64; 4]>())
+                    .into_affine(),
+            };
+            check::<2>(p);
+            check::<4>(p);
+            check::<8>(p);
+        }
+    }
+
     use super::*;
     use ark_bn254::{Fq as ArkFq, G1Affine};
     use ark_ec::{AffineRepr, CurveGroup};
@@ -484,7 +729,7 @@ mod tests {
     fn joint_components_with_both_signs_match_binary_oracle() {
         use ark_bn254::g1::Config;
         use ark_ec::scalar_mul::glv::GLVConfig;
-        use rand::{RngExt, SeedableRng, rngs::StdRng};
+        use rand::{rngs::StdRng, RngExt, SeedableRng};
 
         let beta = Config::ENDO_COEFFS[0];
         assert_ne!(beta, ArkFq::from(1u64));
@@ -527,7 +772,11 @@ mod tests {
                         let expected =
                             (left + if k2_negative { -right } else { right }).into_affine();
                         // (1, 1) directly exercises the joint table entry.
-                        assert_eq!(ours(p).mul_glv(&split.joint_digits()), ours(expected));
+                        let expected = ours(expected);
+                        assert_eq!(ours(p).mul_glv(&split.joint_digits()), expected);
+                        assert_eq!(ours(p).mul_glv_window::<3, 2>(&split), Some(expected));
+                        assert_eq!(ours(p).mul_glv_window::<4, 4>(&split), Some(expected));
+                        assert_eq!(ours(p).mul_glv_window::<5, 8>(&split), Some(expected));
                     }
                 }
             }
