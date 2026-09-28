@@ -1,24 +1,28 @@
 //! Poseidon hash implementation using the Fr scalar field.
 //!
-//! Includes optimized scalar execution routes using sparse matrices
-//! for partial rounds, alongside an AVX-512 IFMA batched execution route
-//! for maximum throughput on supporting hardware.
+//! Uses sparse matrices for partial rounds and scalar or AVX-512 IFMA
+//! arithmetic selected by the compile target and state width.
 //!
 //! # Hybrid Execution Architecture
-//! - Partial Rounds: Uses strictly scalar logic. Because only the first element
-//!   `state[0]` receives an S-box, parallelization provides no benefit here.
-//! - Full Rounds: When compiled for native targets supporting `AVX-512 IFMA`,
-//!   the full rounds dynamically route to an 8-way batched SIMD engine.
+//! - Partial Rounds: A scalar S-box updates `state[0]`. Built-in sparse matrix
+//!   products use IFMA lanes where available; custom tables use scalar arithmetic.
+//! - Full Rounds: The target and width select scalar or eight-lane SIMD layers.
 
 use crate::backend::{Backend, Fr, MontgomeryBackend, U256};
 
 pub mod constants;
+mod scalar;
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512ifma"))]
+mod packed;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512ifma"))]
+mod simd;
 
 /// Sparse matrix representation for Poseidon partial rounds.
 ///
 /// Precomputing the MDS matrix transitions into a sparse vector form reduces
 /// the `O(T^2)` dense matrix multiplication down to an `O(T)` sparse matrix
-/// computation, saving massive Compute Units on-chain.
+/// computation.
 ///
 /// `row` is the matrix's first row; `col[i]` for `i >= 1` is the entry at
 /// `[i][0]`. All other entries are the identity, and `col[0]` is unused.
@@ -48,7 +52,7 @@ pub struct PoseidonConstants<const T: usize> {
     pub sparse_matrices: &'static [SparseMatrix<T>],
 }
 
-/// Computes the scalar Poseidon S-box (`x^5`) using exactly 3 inlined multiplications.
+/// Computes the scalar Poseidon S-box (`x^5`) with two squares and one multiplication.
 #[inline(always)]
 pub fn sbox(x: &U256) -> U256 {
     type B = Backend<Fr>;
@@ -59,8 +63,7 @@ pub fn sbox(x: &U256) -> U256 {
 
 /// Computes 8 Poseidon S-boxes simultaneously utilizing AVX-512 vectorization.
 ///
-/// The state is dynamically chunked in groups of 8. This guarantees full utilization
-/// of the SIMD registers for large state widths.
+/// The state is processed in groups of eight; the final group may be partly filled.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512ifma"))]
 #[inline]
 #[target_feature(enable = "avx512f,avx512ifma,avx512dq")]
@@ -96,31 +99,42 @@ unsafe fn apply_sbox_simd<const T: usize>(state: &mut [U256; T]) {
 ///
 /// # Input criteria
 /// Every element of `state` and of `mds` must be a fully reduced Montgomery-form
-/// field element (`x < Fr::MODULUS`).
+/// field element (`x < Fr::MODULUS`). Packed multiplication and addition both
+/// return canonical residues. Accumulate a complete output chunk before
+/// unpacking it into the scalar representation.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512ifma"))]
 #[inline]
 #[target_feature(enable = "avx512f,avx512ifma,avx512dq")]
 unsafe fn apply_dense_matrix_simd<const T: usize>(state: &mut [U256; T], mds: &[[U256; T]; T]) {
     use crate::backend::avx512::{
-        math::sum_of_products_8x,
+        math::{sum_of_products_8x, sum_products_8x},
         pack::{broadcast, pack_8x, unpack_8x_into},
     };
-
-    let inputs = state.map(|value| unsafe { broadcast(&value) });
+    let columns = packed::dense(mds);
     let mut new_state = [U256::zero(); T];
     let mut i = 0;
     while i < T {
         let chunk_size = core::cmp::min(8, T - i);
-        let columns = core::array::from_fn(|j| {
-            let mut col_chunk = [U256::zero(); 8];
-            for (k, word) in col_chunk[..chunk_size].iter_mut().enumerate() {
-                *word = mds[i + k][j];
+        let sum = if let Some(columns) = columns {
+            // Built-in tables have T<=13 and canonical R260 coefficients.
+            unsafe {
+                sum_products_8x::<T>(|j| (broadcast(&state[j]), columns[(i / 8) * T + j].load()))
             }
-            unsafe { pack_8x(&col_chunk) }
-        });
-
+        } else {
+            // Caller-provided matrices remain in R256 and use the generic
+            // chunked kernel. Built-in R260 tables use the specialized path above.
+            let inputs = state.map(|value| unsafe { broadcast(&value) });
+            let columns = core::array::from_fn(|j| {
+                let mut column = [U256::zero(); 8];
+                for (k, word) in column[..chunk_size].iter_mut().enumerate() {
+                    *word = mds[i + k][j];
+                }
+                unsafe { pack_8x(&column) }
+            });
+            unsafe { sum_of_products_8x(&inputs, &columns) }
+        };
         let mut chunk = [U256::zero(); 8];
-        unsafe { unpack_8x_into(&sum_of_products_8x(&inputs, &columns), &mut chunk) };
+        unsafe { unpack_8x_into(&sum, &mut chunk) };
         new_state[i..i + chunk_size].copy_from_slice(&chunk[..chunk_size]);
         i += chunk_size;
     }
@@ -131,31 +145,86 @@ unsafe fn apply_dense_matrix_simd<const T: usize>(state: &mut [U256; T], mds: &[
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512ifma")))]
 #[inline(always)]
 fn apply_dense_matrix<const T: usize>(state: &mut [U256; T], m: &[[U256; T]; T]) {
-    type B = Backend<Fr>;
-    let input = *state;
-    for (value, row) in state.iter_mut().zip(m) {
-        *value = B::sum_of_products(row, &input);
-    }
+    let new_state = core::array::from_fn(|i| scalar::sum_products(&m[i], state));
+    *state = new_state;
 }
 
 /// Computes only the first output of a dense matrix multiplication.
 #[inline(always)]
 fn apply_dense_matrix_row0<const T: usize>(state: &mut [U256; T], m: &[[U256; T]; T]) {
-    state[0] = Backend::<Fr>::sum_of_products(&m[0], state);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512ifma"))]
+    if simd::use_simd_row0::<T>() {
+        if let Some(value) = unsafe { simd::matrix_row0(state, m) } {
+            state[0] = value;
+            return;
+        }
+    }
+    state[0] = scalar::sum_products(&m[0], state);
 }
 
 /// Executes an `O(T)` sparse matrix multiplication on the scalar state.
 #[inline(always)]
 fn apply_sparse_matrix<const T: usize>(state: &mut [U256; T], m: &SparseMatrix<T>) {
     type B = Backend<Fr>;
+    let first_word = scalar::sum_products(&m.row, state);
     let prev_first = state[0];
-    state[0] = B::sum_of_products(&m.row, state);
-
-    // Identity operations scaled by the sparse column vector
+    state[0] = first_word;
     for (i, state_val) in state.iter_mut().enumerate().skip(1) {
         let term = B::mul(&m.col[i], &prev_first);
         *state_val = B::add(state_val, &term);
     }
+}
+
+/// Multiplies the sparse row and column terms in one stream of IFMA lanes.
+/// The first T terms form the row dot product; the remaining T-1 terms update
+/// the column. In particular, widths 2..=4 use only one vector multiplication.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512ifma"))]
+#[inline]
+#[target_feature(enable = "avx512f,avx512ifma,avx512dq")]
+unsafe fn apply_sparse_matrix_simd<const T: usize>(
+    state: &mut [U256; T],
+    coefficients: &[packed::Packed],
+) {
+    use crate::backend::avx512::{
+        math::mul_fixed_8x,
+        pack::{pack_8x, unpack_8x_into},
+    };
+    type B = Backend<Fr>;
+    let previous_first = state[0];
+    let mut first_word = U256::zero();
+    for (chunk_index, coefficient) in coefficients.iter().enumerate() {
+        let first = chunk_index * 8;
+        let count = core::cmp::min(8, 2 * T - 1 - first);
+        let mut terms = [U256::zero(); 8];
+        // Gather every input before updating any coordinates. Since row terms
+        // precede column terms, an updated column is never a later row input.
+        for (lane, term) in terms[..count].iter_mut().enumerate() {
+            let index = first + lane;
+            *term = if index < T {
+                state[index]
+            } else {
+                previous_first
+            };
+        }
+        unsafe {
+            let product = mul_fixed_8x(&pack_8x(&terms), &coefficient.load());
+            unpack_8x_into(&product, &mut terms);
+        }
+        for (lane, term) in terms[..count].iter().enumerate() {
+            let index = first + lane;
+            if index < T {
+                first_word = if index == 0 {
+                    *term
+                } else {
+                    B::add(&first_word, term)
+                };
+            } else {
+                let index = index - T + 1;
+                state[index] = B::add(&state[index], term);
+            }
+        }
+    }
+    state[0] = first_word;
 }
 
 /// Applies one S-box in scalar full rounds.
@@ -203,6 +272,42 @@ pub fn poseidon<const T: usize>(state: [U256; T], constants: &PoseidonConstants<
     poseidon_inner::<T, false>(state, constants)
 }
 
+/// Applies the partial rounds between the packed full-round halves.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512ifma"))]
+#[inline(always)]
+fn partial_rounds<const T: usize>(
+    state: &mut [U256; T],
+    constants: &PoseidonConstants<T>,
+    mut rc_idx: usize,
+) {
+    type B = Backend<Fr>;
+    let rc = constants.round_constants;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512ifma"))]
+    let packed_sparse = packed::sparse(constants.sparse_matrices);
+    // --- Middle: Partial Rounds ---
+    // Only state[0] receives an S-box. The independent matrix products can
+    // share IFMA lanes, while the single S-box stays scalar.
+    for sparse_idx in 0..constants.partial_rounds {
+        state[0] = B::add(&state[0], &rc[rc_idx]);
+        rc_idx += 1;
+        state[0] = sbox(&state[0]);
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512ifma"))]
+        if let Some(matrices) = packed_sparse {
+            let stride = (2 * T - 1).div_ceil(8);
+            unsafe {
+                apply_sparse_matrix_simd(
+                    state,
+                    &matrices[sparse_idx * stride..(sparse_idx + 1) * stride],
+                );
+            }
+        } else {
+            apply_sparse_matrix(state, &constants.sparse_matrices[sparse_idx]);
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512ifma")))]
+        apply_sparse_matrix(state, &constants.sparse_matrices[sparse_idx]);
+    }
+}
+
 /// With `HASH_ONLY`, only the returned `state[0]` is a valid output coordinate.
 fn poseidon_inner<const T: usize, const HASH_ONLY: bool>(
     mut state: [U256; T],
@@ -215,7 +320,13 @@ fn poseidon_inner<const T: usize, const HASH_ONLY: bool>(
         rc.len(),
         T * constants.full_rounds + constants.partial_rounds
     );
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512ifma"))]
+    if unsafe { simd::permutation::<T, HASH_ONLY>(&mut state, constants) } {
+        return state;
+    }
     let mut rc_idx = 0;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512ifma"))]
+    let packed_sparse = packed::sparse(constants.sparse_matrices);
 
     // --- First Half: Full Rounds ---
     // The final round applies `pre_sparse_matrix`, setting up the sparse
@@ -234,12 +345,25 @@ fn poseidon_inner<const T: usize, const HASH_ONLY: bool>(
     }
 
     // --- Middle: Partial Rounds ---
-    // Kept strictly scalar because only state[0] receives the S-box computation,
-    // rendering SIMD parallelization overhead highly inefficient here.
+    // Only state[0] receives an S-box. The independent matrix products can
+    // share IFMA lanes, while the single S-box stays scalar.
     for sparse_idx in 0..constants.partial_rounds {
         state[0] = B::add(&state[0], &rc[rc_idx]);
         rc_idx += 1;
         state[0] = sbox(&state[0]);
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512ifma"))]
+        if let Some(matrices) = packed_sparse {
+            let stride = (2 * T - 1).div_ceil(8);
+            unsafe {
+                apply_sparse_matrix_simd(
+                    &mut state,
+                    &matrices[sparse_idx * stride..(sparse_idx + 1) * stride],
+                );
+            }
+        } else {
+            apply_sparse_matrix(&mut state, &constants.sparse_matrices[sparse_idx]);
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512ifma")))]
         apply_sparse_matrix(&mut state, &constants.sparse_matrices[sparse_idx]);
     }
 

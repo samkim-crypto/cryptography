@@ -4,10 +4,10 @@
 use ark_bn254::{Fq, Fq2, Fr, G1Affine, G2Affine};
 use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{BigInteger, Field, PrimeField};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use rand::{rngs::StdRng, RngExt, SeedableRng};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use solana_bn254::{backend::U256, g1, g2};
-use solana_bn254_syscall::{addition::*, multiplication::*, Endianness};
+use solana_bn254_syscall::{Endianness, addition::*, multiplication::*};
 use std::{hint::black_box, os::raw::c_ulong, time::Duration};
 
 const SEED: u64 = 0x6731_6732_6265_6e31;
@@ -62,10 +62,10 @@ impl Op {
 unsafe extern "C" {
     fn fd_bn254_g1_add_syscall(out: *mut u8, input: *const u8, len: c_ulong, be: i32) -> i32;
     fn fd_bn254_g1_scalar_mul_syscall(out: *mut u8, input: *const u8, len: c_ulong, be: i32)
-        -> i32;
+    -> i32;
     fn fd_bn254_g2_add_syscall(out: *mut u8, input: *const u8, len: c_ulong, be: i32) -> i32;
     fn fd_bn254_g2_scalar_mul_syscall(out: *mut u8, input: *const u8, len: c_ulong, be: i32)
-        -> i32;
+    -> i32;
 }
 
 // A fixed output buffer avoids adding a benchmark-only heap allocation to each

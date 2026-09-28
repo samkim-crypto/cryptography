@@ -120,6 +120,58 @@ fn check_custom_matrices<const T: usize>() {
     }
 }
 
+/// A copied sparse table must behave identically to the built-in table.
+fn check_copied_sparse_matrices<const T: usize>(base: &PoseidonConstants<T>) {
+    let copied = PoseidonConstants {
+        full_rounds: base.full_rounds,
+        partial_rounds: base.partial_rounds,
+        round_constants: base.round_constants,
+        mds_matrix: base.mds_matrix,
+        pre_sparse_matrix: base.pre_sparse_matrix,
+        sparse_matrices: Box::leak(base.sparse_matrices.to_vec().into_boxed_slice()),
+    };
+    let mut rng = StdRng::seed_from_u64(0x7370_6172_7365_5f63 ^ T as u64);
+    for case in 0..12 {
+        let state = core::array::from_fn(|_| {
+            montgomery(match case {
+                0 => ArkFr::from(0u64),
+                1 => -ArkFr::from(1u64),
+                _ => seeded_value(&mut rng),
+            })
+        });
+        assert_eq!(poseidon(state, base), poseidon(state, &copied));
+        assert_eq!(hash(&state[1..], base), hash(&state[1..], &copied));
+    }
+}
+
+/// Reusing an original table with a custom schedule must behave like a copy.
+fn check_reused_round_constants<const T: usize>(base: &PoseidonConstants<T>) {
+    let reused = PoseidonConstants {
+        full_rounds: base.full_rounds + 2,
+        partial_rounds: base.partial_rounds - 2 * T,
+        round_constants: base.round_constants,
+        mds_matrix: base.mds_matrix,
+        pre_sparse_matrix: base.pre_sparse_matrix,
+        sparse_matrices: base.sparse_matrices,
+    };
+    let copied = PoseidonConstants {
+        round_constants: Box::leak(base.round_constants.to_vec().into_boxed_slice()),
+        ..reused
+    };
+    let mut rng = StdRng::seed_from_u64(0x7263_5f72_6575_7365 ^ T as u64);
+    for case in 0..12 {
+        let state = core::array::from_fn(|_| {
+            montgomery(match case {
+                0 => ArkFr::from(0u64),
+                1 => -ArkFr::from(1u64),
+                _ => seeded_value(&mut rng),
+            })
+        });
+        assert_eq!(poseidon(state, &reused), poseidon(state, &copied));
+        assert_eq!(hash(&state[1..], &reused), hash(&state[1..], &copied));
+    }
+}
+
 macro_rules! matrix_suite {
     ($name:ident, $t:literal, $params:ident) => {
         mod $name {
@@ -133,6 +185,16 @@ macro_rules! matrix_suite {
             #[test]
             fn custom_matrices_match_arkworks() {
                 check_custom_matrices::<$t>();
+            }
+
+            #[test]
+            fn copied_sparse_tables_match() {
+                check_copied_sparse_matrices(&$params);
+            }
+
+            #[test]
+            fn reused_constants_with_custom_schedule() {
+                check_reused_round_constants(&$params);
             }
         }
     };

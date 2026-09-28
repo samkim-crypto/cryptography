@@ -16,7 +16,8 @@
 # Adapted from Firedancer's CIOS Montgomery kernel:
 # https://github.com/firedancer-io/firedancer/blob/20c3fa1ff2dab737ec075c3e3e302ba778fd98fe/src/ballet/bigint/fd_uint256_mul.inc
 # Changes: register-return Rust inline assembly; pointer stores removed.
-# This crate restricts use to BN254 Fq operands below 2q, with 4q < 2^256.
+# Used for BN254 Fq operands below 2q (4q < 2^256), and canonical Fr
+# operands below r (2r < 2^256). The modulus and inverse are arguments.
 
     sub     $128, %rsp
     push    %rbp

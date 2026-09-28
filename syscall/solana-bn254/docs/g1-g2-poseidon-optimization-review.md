@@ -11,6 +11,11 @@ Both final source/comparator runs passed; see the
 [consolidated results](group-optimization-results.md). Poseidon P01–P12 remains
 deferred. The original suggested ordering below is superseded by that user-selected scope.
 
+Status on 2026-09-24: Poseidon P01–P12 trial decisions are complete on
+`poseidon-opt-final`, based on the retained G1/G2 branch. Final combined
+validation/comparison also passed in all three builds. Follow the
+[Poseidon trial ledger](poseidon-optimization-experiments.md) for measured decisions.
+
 There are 25 primary experiment families: P01-P12 and G01-G13. Start with P01
 and P02, which address a concrete gap between our Fq and Fr backends, then run
 the G sequence and the remaining P sequence in order. Within a family, each
@@ -178,7 +183,7 @@ speedups are not estimates for this crate or this devserver.
 
 - **FD-Fr:** [Firedancer scalar arithmetic](https://github.com/firedancer-io/firedancer/blob/20c3fa1ff2dab737ec075c3e3e302ba778fd98fe/src/ballet/bn254/fd_bn254_scalar.h),
   [native multiplication](https://github.com/firedancer-io/firedancer/blob/20c3fa1ff2dab737ec075c3e3e302ba778fd98fe/src/ballet/bigint/fd_uint256_mul.h),
-  and [Poseidon](https://github.com/firedancer-io/firedancer/blob/20c3fa1ff2dab737ec075c3e3e302ba778fd98fe/src/ballet/poseidon/fd_poseidon.c).
+  and [Poseidon](https://github.com/firedancer-io/firedancer/blob/20c3fa1ff2dab737ec075c3e3e302ba778fd98fe/src/ballet/bn254/fd_poseidon.c).
 - **FD-GLV:** [Firedancer GLV integer helpers](https://github.com/firedancer-io/firedancer/blob/20c3fa1ff2dab737ec075c3e3e302ba778fd98fe/src/ballet/bn254/fd_bn254_glv.h).
 - **safegcd:** [libsecp256k1's safegcd explanation, section 6](https://github.com/bitcoin-core/secp256k1/blob/master/doc/safegcd_implementation.md)
   and [64-bit implementation](https://github.com/bitcoin-core/secp256k1/blob/master/src/modinv64_impl.h),

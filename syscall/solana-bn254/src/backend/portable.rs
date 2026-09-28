@@ -1,4 +1,4 @@
-//! Multi-limb arithmetic with an optional native Fq multiplication kernel.
+//! Multi-limb arithmetic with optional native Fq and Fr multiplication kernels.
 //!
 //! Provides a `MontgomeryBackend` using 64-bit limb arithmetic
 //! with a portable fallback on targets without Linux x86_64 ADX/BMI2.
@@ -42,7 +42,7 @@ fn mac_row(t: &mut [u64], s: u64, v: &U256, pending: u64) -> u64 {
     carry_out
 }
 
-/// Montgomery arithmetic with a portable fallback and optional native Fq kernel.
+/// Montgomery arithmetic with a portable fallback and optional native Fq/Fr kernels.
 pub struct PortableBackend<F: Field>(PhantomData<F>);
 
 #[cfg(all(
@@ -112,8 +112,8 @@ impl<F: Field> PortableBackend<F> {
             target_feature = "adx",
             target_feature = "bmi2",
         ))]
-        if F::MODULUS == crate::backend::Fq::MODULUS {
-            return adx::mul(a, b);
+        if F::MODULUS == crate::backend::Fq::MODULUS || F::MODULUS == crate::backend::Fr::MODULUS {
+            return adx::mul::<F>(a, b);
         }
 
         // Write p = MODULUS and W = 2^64. Each CIOS step is

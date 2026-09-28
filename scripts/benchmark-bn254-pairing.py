@@ -39,6 +39,8 @@ def execute(command, **kwargs):
 def snapshot(args):
     root = args.firedancer.resolve()
     sources = sorted((root / "src/ballet/bn254").glob("fd_bn254*.c"))
+    if getattr(args, "poseidon", False):
+        sources.append(root / "src/ballet/bn254/fd_poseidon.c")
     if not sources:
         raise SystemExit("No Firedancer BN254 C sources found")
     pending = list(sources)
@@ -93,8 +95,8 @@ def run(args):
     root = Path(__file__).resolve().parent.parent
     os.chdir(root)
     bench = getattr(args, "bench", "pairing_compare")
-    metadata_path = root / ("group-comparison-metadata.json" if bench == "group_compare"
-                            else "pairing-comparison-metadata.json")
+    metadata_name = {"group_compare": "group", "poseidon_bench": "poseidon"}.get(bench, "pairing")
+    metadata_path = root / f"{metadata_name}-comparison-metadata.json"
     archive = args.archive.resolve()
     build = Path(os.environ["CARGO_TARGET_DIR"]).resolve() / "firedancer-pairing"
     build.mkdir(parents=True, exist_ok=False)
@@ -131,6 +133,7 @@ def run(args):
         "cflags": cflags,
         "rustc": capture(["rustc", "-vV"]),
         "rustflags": os.environ.get("RUSTFLAGS", ""),
+        "ark_asm": bool(getattr(args, "ark_asm", False)),
         "cargo_lock_sha256": digest((root / "Cargo.lock").read_bytes()),
         "lscpu": capture(["lscpu"]),
         "cpu_affinity": sorted(os.sched_getaffinity(0)),
@@ -144,13 +147,22 @@ def run(args):
         obj = build / (Path(name).stem + ".o")
         execute([cc, *cflags, "-c", str(source / name), "-o", str(obj)], cwd=source)
         objects.append(str(obj))
+    if bench == "poseidon_bench":
+        wrapper = root / "syscall/solana-bn254/benches/common/firedancer_poseidon.c"
+        obj = build / "poseidon_wrapper.o"
+        execute([cc, *cflags, "-I", str(source), "-c", str(wrapper), "-o", str(obj)], cwd=source)
+        objects.append(str(obj))
+        metadata["wrapper_sha256"] = digest(wrapper.read_bytes())
     execute(["ar", "rcs", str(build / "libfiredancer_bn254.a"), *objects])
 
     if args.test:
-        execute(["cargo", "test", "--locked", "-p", "solana-bn254", "--lib", "--tests"])
+        test_command = ["cargo", "test", "--locked", "-p", "solana-bn254", "--lib", "--tests"]
+        if getattr(args, "ark_asm", False):
+            test_command += ["--features", "ark-ff/asm"]
+        execute(test_command)
     command = [
         "cargo", "rustc", "--locked", "--profile", "bench", "-p", "solana-bn254",
-        "--features", "firedancer-bench", "--bench", bench,
+        "--features", "firedancer-bench,ark-ff/asm" if getattr(args, "ark_asm", False) else "firedancer-bench", "--bench", bench,
         "--message-format=json", "--", "-L", f"native={build}",
     ]
     metadata["cargo_command"] = command
@@ -182,10 +194,12 @@ def main():
     local = sub.add_parser("snapshot", help="Archive the C sources and their quoted include dependencies")
     local.add_argument("--firedancer", type=Path, required=True)
     local.add_argument("--archive", type=Path, default=Path(DEFAULT_ARCHIVE))
+    local.add_argument("--poseidon", action="store_true", help="Include the Poseidon implementation and parameters")
     remote = sub.add_parser("run", help="Build and benchmark inside the benchctl queue")
     remote.add_argument("--archive", type=Path, default=Path(DEFAULT_ARCHIVE))
     remote.add_argument("--cc", default="gcc")
-    remote.add_argument("--bench", choices=["pairing_compare", "group_compare"], default="pairing_compare")
+    remote.add_argument("--ark-asm", action="store_true", help="Enable Arkworks' optional native assembly feature")
+    remote.add_argument("--bench", choices=["pairing_compare", "group_compare", "poseidon_bench"], default="pairing_compare")
     remote.add_argument("--test", action="store_true", help="Run crate tests and Criterion correctness smoke checks")
     remote.add_argument("criterion_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()

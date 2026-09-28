@@ -3,7 +3,7 @@
 //! Inputs and outputs are canonical Montgomery residues with radix `2^256`.
 //! Only the private five-limb accumulator is unreduced; it is below `10q`.
 
-use crate::backend::{portable::small_multiple::reduce, Field, Fq, Fq2, U256};
+use crate::backend::{Field, Fq, Fq2, U256, portable::small_multiple::reduce};
 
 const Q: [u64; 4] = Fq::MODULUS.0;
 
@@ -53,7 +53,7 @@ mod tests {
     use ark_bn254::Fq as ArkFq;
     use ark_ff::{BigInt, BigInteger, PrimeField};
     use num_bigint::BigUint;
-    use rand::{rngs::StdRng, RngExt, SeedableRng};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::vec;
 
     fn integer(value: U256) -> BigUint {
