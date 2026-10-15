@@ -158,6 +158,41 @@ fn raw_scalars_match_binary_oracle_including_nonsubgroup_points() {
 }
 
 #[test]
+fn short_scalars_of_every_length_match_binary_oracle() {
+    // Below 2^128, dense scalars use signed windows and sparse ones binary,
+    // for raw multiplication on the whole twist and for checked multiplication.
+    let mut rng = StdRng::seed_from_u64(0x6732_5f73_686f_7274);
+    for bits in 2..=130u32 {
+        for sparse in [false, true] {
+            let mut limbs = [0u64; 4];
+            for bit in 0..bits - 1 {
+                let set = if sparse {
+                    rng.random_ratio(1, 16)
+                } else {
+                    rng.random()
+                };
+                limbs[bit as usize / 64] |= u64::from(set) << (bit % 64);
+            }
+            limbs[(bits - 1) as usize / 64] |= 1 << ((bits - 1) % 64);
+            let twist = on_curve(&mut rng);
+            check(
+                ours(twist).mul_scalar(&U256::new(limbs)),
+                twist.mul_bigint(limbs).into_affine(),
+            );
+            let subgroup = G2Affine::generator()
+                .mul_bigint(rng.random::<[u64; 4]>())
+                .into_affine();
+            check(
+                ours(subgroup)
+                    .mul_scalar_checked(&U256::new(limbs))
+                    .unwrap(),
+                subgroup.mul_bigint(limbs).into_affine(),
+            );
+        }
+    }
+}
+
+#[test]
 fn every_scalar_bit_and_group_order_boundaries() {
     let mut rng = StdRng::seed_from_u64(0x6732_5f62_6974_7331);
     let points = [

@@ -20,16 +20,27 @@ fn recode<const W: u32, const N: usize, const L: usize>(mut scalar: [u64; N]) ->
         len: 0,
     };
     while scalar.iter().any(|&word| word != 0) {
-        let digit = if scalar[0] & 1 == 0 {
-            0
+        if scalar[0] & 1 == 0 {
+            // Even values give zero digits, which the array already holds.
+            // Skip the run, at most one word at a time.
+            let zeros = scalar[0].trailing_zeros();
+            result.len += zeros as usize;
+            for i in 0..N {
+                let high = if i + 1 < N { scalar[i + 1] } else { 0 };
+                scalar[i] = if zeros == 64 {
+                    high
+                } else {
+                    (scalar[i] >> zeros) | high.checked_shl(64 - zeros).unwrap_or(0)
+                };
+            }
+            continue;
+        }
+        let low = (scalar[0] & ((1 << W) - 1)) as i16;
+        let digit = (if low >= 1 << (W - 1) {
+            low - (1 << W)
         } else {
-            let low = (scalar[0] & ((1 << W) - 1)) as i16;
-            (if low >= 1 << (W - 1) {
-                low - (1 << W)
-            } else {
-                low
-            }) as i8
-        };
+            low
+        }) as i8;
         result.digits[result.len] = digit;
         result.len += 1;
         // Shift first: (k-d)/2 = (k>>1)-floor(d/2). In particular, a
@@ -57,6 +68,25 @@ fn recode<const W: u32, const N: usize, const L: usize>(mut scalar: [u64; N]) ->
         }
     }
     result
+}
+
+/// Chooses a signed window width for a scalar below 2^128, or None when
+/// binary is estimated cheaper. Costs count base-field products: about 11 per
+/// mixed addition and about 30 or 67 for odd tables of two or four entries.
+/// Width-w digits are nonzero about once in w+1 positions, while binary adds
+/// once per set bit, so sparse scalars keep binary.
+pub(super) fn short_width(magnitude: u128) -> Option<u32> {
+    let bits = 128 - magnitude.leading_zeros();
+    let binary = 11 * magnitude.count_ones().saturating_sub(1);
+    let window = |width: u32, setup: u32| setup + 11 * bits / (width + 1);
+    let (three, four) = (window(3, 30), window(4, 67));
+    if binary <= three.min(four) {
+        None
+    } else if four < three {
+        Some(4)
+    } else {
+        Some(3)
+    }
 }
 
 pub(super) fn from_u128<const W: u32>(value: u128) -> Digits<129> {

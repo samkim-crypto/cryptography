@@ -172,6 +172,24 @@ impl Affine {
             [1, 0, 0, 0] => return if negative { -*self } else { *self },
             _ => {}
         }
+        // Below 2^128 the GLV split leaves its first component nearly the
+        // whole scalar, so a one-dimensional window avoids the split's setup.
+        if scalar.0[2] | scalar.0[3] == 0 {
+            let magnitude = u128::from(scalar.0[0]) | (u128::from(scalar.0[1]) << 64);
+            let split = glv::SplitScalar {
+                k1: magnitude,
+                k2: 0,
+                k2_negative: false,
+            };
+            let windowed = match super::window::short_width(magnitude) {
+                Some(3) => self.mul_glv_window::<3, 2>(&split),
+                Some(4) => self.mul_glv_window::<4, 4>(&split),
+                _ => None,
+            };
+            if let Some(result) = windowed {
+                return if negative { -result } else { result };
+            }
+        }
         // Small magnitudes avoid recoding and table setup. Larger magnitudes,
         // including raw 128-bit inputs, compare the actual signed schedule.
         if scalar.0[1] != 0 || scalar.0[2] != 0 || scalar.0[3] != 0 {

@@ -171,6 +171,31 @@ fn raw_scalar_multiplication_matches_arkworks() {
 }
 
 #[test]
+fn short_scalars_of_every_length_match_arkworks() {
+    // Below 2^128, dense scalars use signed windows and sparse ones binary.
+    let mut rng = StdRng::seed_from_u64(0x6731_5f73_686f_7274);
+    for bits in 2..=130u32 {
+        for sparse in [false, true] {
+            let p = random_point(&mut rng);
+            let mut limbs = [0u64; 4];
+            for bit in 0..bits - 1 {
+                let set = if sparse {
+                    rng.random_ratio(1, 16)
+                } else {
+                    rng.random()
+                };
+                limbs[bit as usize / 64] |= u64::from(set) << (bit % 64);
+            }
+            limbs[(bits - 1) as usize / 64] |= 1 << ((bits - 1) % 64);
+            check(
+                ours(p).mul_scalar(&U256::new(limbs)),
+                p.mul_bigint(limbs).into_affine(),
+            );
+        }
+    }
+}
+
+#[test]
 fn every_scalar_bit_and_order_boundaries() {
     let mut rng = StdRng::seed_from_u64(0x6731_5f62_6974_7631);
     let p = random_point(&mut rng);

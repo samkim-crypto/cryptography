@@ -302,7 +302,23 @@ impl Affine {
                 return result;
             }
         }
+        if let Some(result) = self.mul_short_window(scalar) {
+            return result;
+        }
         self.mul_projective(&scalar.0).to_affine()
+    }
+
+    /// Multiplies by an ordinary integer below 2^128 with a signed window,
+    /// unless binary is estimated cheaper. Valid on the entire twist.
+    fn mul_short_window(&self, scalar: &U256) -> Option<Self> {
+        if scalar.0[2] | scalar.0[3] != 0 {
+            return None;
+        }
+        let magnitude = u128::from(scalar.0[0]) | (u128::from(scalar.0[1]) << 64);
+        match super::window::short_width(magnitude)? {
+            3 => self.mul_raw_window::<3, 2>(scalar),
+            _ => self.mul_raw_window::<4, 4>(scalar),
+        }
     }
 
     /// Checks subgroup membership, then multiplies by any unsigned 256-bit integer.
@@ -327,7 +343,9 @@ impl Affine {
                 negative = sign;
             }
         }
-        let result = if magnitude.0[1] | magnitude.0[2] | magnitude.0[3] == 0 {
+        let result = if let Some(result) = self.mul_short_window(&magnitude) {
+            result
+        } else if magnitude.0[1] | magnitude.0[2] | magnitude.0[3] == 0 {
             match magnitude.0[0] {
                 0 => Self::IDENTITY,
                 1 => *self,
