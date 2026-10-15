@@ -26,8 +26,8 @@ pub trait Field: Send + Sync + 'static {
 ///
 /// Implementations process field elements in Montgomery form. Because
 /// this crate operates on public data, constant-time execution is
-/// explicitly NOT required. Implementations will rely on fast conditional
-/// branches (e.g., simple subtraction for final reduction).
+/// explicitly NOT required. Implementations may use data-dependent branches
+/// wherever they are faster.
 pub trait MontgomeryBackend<F: Field> {
     /// Computes `(a + b) mod MODULUS`.
     fn add(a: &U256, b: &U256) -> U256;

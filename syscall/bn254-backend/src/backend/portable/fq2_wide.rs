@@ -13,6 +13,21 @@ use crate::backend::{Field, Fq, Fq2, U256};
 #[derive(Clone, Copy)]
 struct Wide([u64; 8]);
 
+/// q*2^254, a multiple of q above every product of canonical operands.
+const Q_SHIFTED: Wide = {
+    let q = Fq::MODULUS.0;
+    Wide([
+        0,
+        0,
+        0,
+        q[0] << 62,
+        (q[0] >> 2) | (q[1] << 62),
+        (q[1] >> 2) | (q[2] << 62),
+        (q[2] >> 2) | (q[3] << 62),
+        q[3] >> 2,
+    ])
+};
+
 impl Wide {
     #[inline]
     fn product(a: &U256, b: &U256) -> Self {
@@ -36,6 +51,17 @@ impl Wide {
             (t[i], borrow) = sbb(self.0[i], rhs.0[i], borrow);
         }
         (Self(t), borrow)
+    }
+
+    #[inline]
+    #[allow(clippy::needless_range_loop)] // Keep the audited limb/carry schedule explicit.
+    fn add(self, rhs: Self) -> (Self, u64) {
+        let mut t = [0; 8];
+        let mut carry = 0;
+        for i in 0..8 {
+            (t[i], carry) = adc(self.0[i], rhs.0[i], carry);
+        }
+        (Self(t), carry)
     }
 
     #[inline]
@@ -67,16 +93,14 @@ pub(in crate::backend) fn mul(a: Fq2, b: Fq2) -> Fq2 {
     debug_assert_eq!(borrow, 0);
     let (cross, borrow) = cross.sub(imaginary_product);
     debug_assert_eq!(borrow, 0);
-    // The real numerator is in (-q²,q²). Add qR only when negative;
-    // this leaves its Montgomery residue unchanged and yields [0,qR).
-    let (mut real, borrow) = real_product.sub(imaginary_product);
-    let mask = 0u64.wrapping_sub(borrow);
-    let mut carry = 0;
-    for i in 0..4 {
-        (real.0[i + 4], carry) = adc(real.0[i + 4], Fq::MODULUS.0[i] & mask, carry);
-    }
-    // A negative wrapped difference plus qR carries beyond 512 bits.
-    debug_assert_eq!(carry, borrow);
+    // The real numerator is in (-q²,q²). Adding q*2^254 > q² always, rather
+    // than qR only when negative, avoids a data-dependent branch. It leaves
+    // the Montgomery residue unchanged, and q < 2^254 keeps the result in
+    // (0, q*2^255), below qR.
+    let (real, carry) = real_product.add(Q_SHIFTED);
+    debug_assert_eq!(carry, 0);
+    let (real, borrow) = real.sub(imaginary_product);
+    debug_assert_eq!(borrow, 0);
     Fq2 {
         c0: real.reduce(),
         c1: cross.reduce(),

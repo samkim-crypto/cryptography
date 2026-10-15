@@ -17,49 +17,61 @@ struct Signed {
     high: i64,
 }
 
+// Ported from libsecp256k1's `secp256k1_modinv64_divsteps_62_var`, which
+// uses eta = -delta:
+// https://github.com/bitcoin-core/secp256k1/blob/master/src/modinv64_impl.h
+// Each iteration adds the multiple of f that cancels up to 6 (after a swap)
+// or 4 low bits of g, then shifts all zero bits at once. At most eta+1 bits
+// are cancelled, so no swap can occur inside the window and the result
+// equals that many individual divsteps.
 #[inline(always)]
-fn divsteps(mut delta: i32, mut f: u64, mut g: u64) -> (i32, [[i64; 2]; 2]) {
-    let (mut u, mut v, mut q, mut r) = (1i64, 0i64, 0i64, 1i64);
+fn divsteps(delta: i32, mut f: u64, mut g: u64) -> (i32, [[i64; 2]; 2]) {
+    let (mut u, mut v, mut q, mut r) = (1u64, 0u64, 0u64, 1u64);
+    let mut eta = -delta;
     let mut remaining = STEPS;
-    while remaining != 0 {
-        // Consecutive even-g divsteps leave f and the second matrix row
-        // unchanged. Combine their shifts and first-row scalings. This is the
-        // run-skipping optimization described in libsecp256k1's safegcd notes,
-        // section 6: https://github.com/bitcoin-core/secp256k1/blob/master/doc/safegcd_implementation.md
-        // Cap at the batch boundary, including g=0 (trailing_zeros returns 64).
-        // At most 62 steps have occurred, so scaled row norms remain <=2^62.
-        let zeros = g.trailing_zeros().min(remaining);
-        if zeros != 0 {
-            g >>= zeros;
-            let scale = 1i64 << zeros;
-            u *= scale;
-            v *= scale;
-            delta += zeros as i32;
-            remaining -= zeros;
-            if remaining == 0 {
-                break;
-            }
+    loop {
+        // The sentinel bits cap the zero count at the batch boundary.
+        let zeros = (g | (u64::MAX << remaining)).trailing_zeros();
+        g >>= zeros;
+        u <<= zeros;
+        v <<= zeros;
+        eta -= zeros as i32;
+        remaining -= zeros;
+        if remaining == 0 {
+            break;
         }
+        debug_assert_eq!(f & 1, 1);
         debug_assert_eq!(g & 1, 1);
-        remaining -= 1;
-        if delta > 0 {
-            delta = 1 - delta;
-            (f, g) = (g, g.wrapping_sub(f) >> 1);
-            (u, v, q, r) = (2 * q, 2 * r, q - u, r - v);
+        let (w, mask) = if eta < 0 {
+            eta = -eta;
+            (f, g) = (g, f.wrapping_neg());
+            (u, q) = (q, u.wrapping_neg());
+            (v, r) = (r, v.wrapping_neg());
+            let limit = (eta as u32 + 1).min(remaining);
+            let mask = (u64::MAX >> (64 - limit)) & 63;
+            // f*(f*f-2) = -1/f mod 64 for odd f.
+            let w = f
+                .wrapping_mul(g)
+                .wrapping_mul(f.wrapping_mul(f).wrapping_sub(2));
+            (w & mask, mask)
         } else {
-            delta += 1;
-            g = g.wrapping_add(f) >> 1;
-            q += u;
-            r += v;
-            u *= 2;
-            v *= 2;
-        }
+            let limit = (eta as u32 + 1).min(remaining);
+            let mask = (u64::MAX >> (64 - limit)) & 15;
+            // f+((f+1)&4)*2 = 1/f mod 16 for odd f.
+            let inverse = f.wrapping_add((f.wrapping_add(1) & 4) << 1);
+            (inverse.wrapping_neg().wrapping_mul(g) & mask, mask)
+        };
+        g = g.wrapping_add(f.wrapping_mul(w));
+        q = q.wrapping_add(u.wrapping_mul(w));
+        r = r.wrapping_add(v.wrapping_mul(w));
+        debug_assert_eq!(g & mask, 0);
     }
+    let (u, v, q, r) = (u as i64, v as i64, q as i64, r as i64);
     // Each step increases each row's absolute sum by at most a factor of two.
     // Thus all coefficients and intermediate updates fit signed 64-bit words.
     debug_assert!(u.unsigned_abs() + v.unsigned_abs() <= 1 << STEPS);
     debug_assert!(q.unsigned_abs() + r.unsigned_abs() <= 1 << STEPS);
-    (delta, [[u, v], [q, r]])
+    (-eta, [[u, v], [q, r]])
 }
 
 #[inline(always)]

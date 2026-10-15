@@ -6,7 +6,7 @@
 //! <https://www.microsoft.com/en-us/research/wp-content/uploads/1996/01/j37acmon.pdf>.
 
 use super::{Field, MontgomeryBackend, U256};
-use core::marker::PhantomData;
+use core::{hint::select_unpredictable, marker::PhantomData};
 
 /// Computes `a + b + carry`, returning `(result, carry_out)`.
 #[inline(always)]
@@ -57,7 +57,6 @@ pub(super) mod fq2_wide;
 mod fq_reduction;
 mod inversion;
 pub(crate) mod small_multiple;
-mod square;
 
 pub(super) use fq2_sum::FqSum;
 
@@ -177,12 +176,15 @@ impl<F: Field> PortableBackend<F> {
         let (d2, br) = sbb(x[2], F::MODULUS.0[2], br);
         let (d3, br) = sbb(x[3], F::MODULUS.0[3], br);
 
-        // If no carry out and subtraction underflowed, x < MODULUS.
-        if hi == 0 && br == 1 {
-            U256::new(x)
-        } else {
-            U256::new([d0, d1, d2, d3])
-        }
+        // If no carry out and subtraction underflowed, x < MODULUS. The
+        // outcome is data-dependent, so select per limb instead of branching.
+        let keep = hi == 0 && br == 1;
+        U256::new([
+            select_unpredictable(keep, x[0], d0),
+            select_unpredictable(keep, x[1], d1),
+            select_unpredictable(keep, x[2], d2),
+            select_unpredictable(keep, x[3], d3),
+        ])
     }
 }
 
@@ -211,16 +213,19 @@ impl<F: Field> MontgomeryBackend<F> for PortableBackend<F> {
         let (r2, br) = sbb(a.0[2], b.0[2], br);
         let (r3, br) = sbb(a.0[3], b.0[3], br);
 
-        if br > 0 {
-            // Underflow occurred, add the modulus back to wrap around.
-            let (d0, c) = adc(r0, F::MODULUS.0[0], 0);
-            let (d1, c) = adc(r1, F::MODULUS.0[1], c);
-            let (d2, c) = adc(r2, F::MODULUS.0[2], c);
-            let (d3, _) = adc(r3, F::MODULUS.0[3], c);
-            U256::new([d0, d1, d2, d3])
-        } else {
-            U256::new([r0, r1, r2, r3])
-        }
+        // On underflow, add the modulus back to wrap around. The outcome is
+        // data-dependent, so compute both and select per limb.
+        let (d0, c) = adc(r0, F::MODULUS.0[0], 0);
+        let (d1, c) = adc(r1, F::MODULUS.0[1], c);
+        let (d2, c) = adc(r2, F::MODULUS.0[2], c);
+        let (d3, _) = adc(r3, F::MODULUS.0[3], c);
+        let wrapped = br > 0;
+        U256::new([
+            select_unpredictable(wrapped, d0, r0),
+            select_unpredictable(wrapped, d1, r1),
+            select_unpredictable(wrapped, d2, r2),
+            select_unpredictable(wrapped, d3, r3),
+        ])
     }
 
     #[inline(always)]
@@ -228,13 +233,10 @@ impl<F: Field> MontgomeryBackend<F> for PortableBackend<F> {
         Self::mul_cios(a, b)
     }
 
+    // A dedicated Fq square measured slower than this in G1 multiplication.
     #[inline(always)]
     fn sqr(a: &U256) -> U256 {
-        if F::MODULUS == crate::backend::Fq::MODULUS {
-            square::square(a)
-        } else {
-            Self::mul(a, a)
-        }
+        Self::mul(a, a)
     }
 
     #[inline(always)]

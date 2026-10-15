@@ -337,6 +337,28 @@ fn sum_g2_coefficients(a: &crate::backend::U256, b: &crate::backend::U256) -> cr
     U256::new(words)
 }
 
+// Private `a + q - b` for canonical a,b, as an immediate packed multiplier
+// input. It lies in (0, 2q) and, like a sum above, must never be returned as
+// a canonical Fq2 coefficient.
+#[inline]
+fn difference_g2_coefficients(
+    a: &crate::backend::U256,
+    b: &crate::backend::U256,
+) -> crate::backend::U256 {
+    use crate::backend::{Backend, Field, Fq, MontgomeryBackend, U256};
+    type B = Backend<Fq>;
+    debug_assert!(B::is_reduced(a) && B::is_reduced(b));
+    let mut words = [0; 4];
+    let mut carry = 0i128;
+    for (i, word) in words.iter_mut().enumerate() {
+        let value = a.0[i] as i128 + Fq::MODULUS.0[i] as i128 - b.0[i] as i128 + carry;
+        *word = value as u64;
+        carry = value >> 64;
+    }
+    debug_assert_eq!(carry, 0);
+    U256::new(words)
+}
+
 /// Two Fq2 squares and one independent Fq2 product, using seven of eight lanes.
 /// Input/output coefficients are canonical R=2^256 Montgomery Fq residues.
 ///
@@ -353,20 +375,21 @@ pub(crate) unsafe fn fq2_two_squares_and_product(
     use crate::backend::{Backend, Fq, Fq2, MontgomeryBackend, U256};
     type B = Backend<Fq>;
     let [x, y] = squares;
+    // A square is (c0+c1)(c0+q-c1) + (2*c0)*c1*u, with both lanes' inputs below 2q.
     let lhs = [
         sum_g2_coefficients(&x.c0, &x.c1),
-        x.c0,
+        sum_g2_coefficients(&x.c0, &x.c0),
         sum_g2_coefficients(&y.c0, &y.c1),
-        y.c0,
+        sum_g2_coefficients(&y.c0, &y.c0),
         a.c0,
         a.c1,
         sum_g2_coefficients(&a.c0, &a.c1),
         U256::zero(),
     ];
     let rhs = [
-        B::sub(&x.c0, &x.c1),
+        difference_g2_coefficients(&x.c0, &x.c1),
         x.c1,
-        B::sub(&y.c0, &y.c1),
+        difference_g2_coefficients(&y.c0, &y.c1),
         y.c1,
         b.c0,
         b.c1,
@@ -375,14 +398,8 @@ pub(crate) unsafe fn fq2_two_squares_and_product(
     ];
     let p = unpack_8x(&mul_8x(&pack_8x(&lhs), &pack_8x(&rhs)));
     [
-        Fq2 {
-            c0: p[0],
-            c1: B::add(&p[1], &p[1]),
-        },
-        Fq2 {
-            c0: p[2],
-            c1: B::add(&p[3], &p[3]),
-        },
+        Fq2 { c0: p[0], c1: p[1] },
+        Fq2 { c0: p[2], c1: p[3] },
         Fq2 {
             c0: B::sub(&p[4], &p[5]),
             c1: B::sub(&B::sub(&p[6], &p[4]), &p[5]),
@@ -401,17 +418,17 @@ pub(crate) unsafe fn fq2_three_squares(
     values: [crate::backend::Fq2; 3],
 ) -> [crate::backend::Fq2; 3] {
     use super::pack::{pack_8x, unpack_8x};
-    use crate::backend::{Backend, Fq, Fq2, MontgomeryBackend, U256};
-    type B = Backend<Fq>;
+    use crate::backend::{Fq2, U256};
     let lhs = core::array::from_fn(|i| {
         if i >= 6 {
             return U256::zero();
         }
+        // Each square is (c0+c1)(c0+q-c1) + (2*c0)*c1*u.
         let x = values[i / 2];
         if i % 2 == 0 {
             sum_g2_coefficients(&x.c0, &x.c1)
         } else {
-            x.c0
+            sum_g2_coefficients(&x.c0, &x.c0)
         }
     });
     let rhs = core::array::from_fn(|i| {
@@ -420,7 +437,7 @@ pub(crate) unsafe fn fq2_three_squares(
         }
         let x = values[i / 2];
         if i % 2 == 0 {
-            B::sub(&x.c0, &x.c1)
+            difference_g2_coefficients(&x.c0, &x.c1)
         } else {
             x.c1
         }
@@ -428,7 +445,7 @@ pub(crate) unsafe fn fq2_three_squares(
     let p = unpack_8x(&mul_8x(&pack_8x(&lhs), &pack_8x(&rhs)));
     core::array::from_fn(|i| Fq2 {
         c0: p[2 * i],
-        c1: B::add(&p[2 * i + 1], &p[2 * i + 1]),
+        c1: p[2 * i + 1],
     })
 }
 

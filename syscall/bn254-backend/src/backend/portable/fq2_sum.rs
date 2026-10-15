@@ -1,6 +1,6 @@
 //! Private input sums for Fq2 products. Outputs are canonical Fq residues.
 
-use super::{PortableBackend, adc};
+use super::{PortableBackend, adc, sbb};
 use crate::backend::{Field, Fq, MontgomeryBackend, U256};
 
 type B = PortableBackend<Fq>;
@@ -21,8 +21,23 @@ impl FqSum {
         Self(U256::new([r0, r1, r2, a.0[3] + b.0[3] + c]))
     }
 
+    /// Computes `a + q - b` for canonical coefficients, which lies in (0, 2q).
+    #[inline(always)]
+    pub(in crate::backend) fn difference(a: &U256, b: &U256) -> Self {
+        debug_assert!(B::is_reduced(a) && B::is_reduced(b));
+        // q - b > 0 for canonical b, so the subtraction cannot borrow.
+        let (d0, br) = sbb(Fq::MODULUS.0[0], b.0[0], 0);
+        let (d1, br) = sbb(Fq::MODULUS.0[1], b.0[1], br);
+        let (d2, br) = sbb(Fq::MODULUS.0[2], b.0[2], br);
+        let (d3, _) = sbb(Fq::MODULUS.0[3], b.0[3], br);
+        let (r0, c) = adc(a.0[0], d0, 0);
+        let (r1, c) = adc(a.0[1], d1, c);
+        let (r2, c) = adc(a.0[2], d2, c);
+        // a + q - b < 2q < 2^255, so the top limb cannot overflow.
+        Self(U256::new([r0, r1, r2, a.0[3] + d3 + c]))
+    }
+
     /// Returns a canonical product, in the original Montgomery domain.
-    #[cfg(test)]
     #[inline(always)]
     pub(in crate::backend) fn product(self, rhs: Self) -> U256 {
         // q < 2^254, so 4q < R. For a,b < 2q, the CIOS invariant
@@ -87,6 +102,10 @@ mod tests {
                 let sum = FqSum::new(&raw(a), &raw(b));
                 assert_eq!(integer(&sum.0), a + b);
                 assert!(integer(&sum.0) < 2u8 * &q);
+                let difference = FqSum::difference(&raw(a), &raw(b));
+                assert_eq!(integer(&difference.0), a + &q - b);
+                assert!(integer(&difference.0) > BigUint::from(0u8));
+                assert!(integer(&difference.0) < 2u8 * &q);
             }
         }
     }

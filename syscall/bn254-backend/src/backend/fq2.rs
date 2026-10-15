@@ -52,12 +52,12 @@ impl Fq2 {
     }
 
     /// Computes the square with two base-field multiplications.
+    /// Both use unreduced operands below 2q in place of modular add/sub.
     #[inline]
     pub fn square(&self) -> Self {
-        let product = B::mul(&self.c0, &self.c1);
         Self {
-            c0: FqSum::new(&self.c0, &self.c1).product_reduced(&B::sub(&self.c0, &self.c1)),
-            c1: B::add(&product, &product),
+            c0: FqSum::new(&self.c0, &self.c1).product(FqSum::difference(&self.c0, &self.c1)),
+            c1: FqSum::new(&self.c0, &self.c0).product_reduced(&self.c1),
         }
     }
 
