@@ -288,8 +288,9 @@ impl CompressedEdwardsY {
 
     /// Like `is_valid`, but in variable time. For public data only.
     pub fn is_valid_vartime(&self) -> bool {
-        let (_, u, v) = decompress::prepare(self);
-        (&u * &v).is_square_vartime()
+        let u = &FieldElement::from_bytes(self.as_bytes()).square() - &FieldElement::ONE;
+        // 121666 (y² - 1)(d y² + 1) = u - 121665u², and 121666 is a nonzero square.
+        (&u - &u.square().mul_small(121665)).is_square_vartime()
     }
 
     /// The encoding of the sum of the two encoded points, in variable time.
