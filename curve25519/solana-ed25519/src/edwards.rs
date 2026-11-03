@@ -286,6 +286,12 @@ impl CompressedEdwardsY {
         (&u * &v).is_square().into()
     }
 
+    /// Like `is_valid`, but in variable time. For public data only.
+    pub fn is_valid_vartime(&self) -> bool {
+        let (_, u, v) = decompress::prepare(self);
+        (&u * &v).is_square_vartime()
+    }
+
     /// The encoding of the sum of the two encoded points, in variable time.
     ///
     /// Returns `None` if either encoding is not a curve point, and otherwise
