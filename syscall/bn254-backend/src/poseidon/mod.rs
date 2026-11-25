@@ -22,30 +22,30 @@ pub mod constants;
 ///
 /// `row` is the matrix's first row; `col[i]` for `i >= 1` is the entry at
 /// `[i][0]`. All other entries are the identity, and `col[0]` is unused.
-#[derive(Clone, Debug)]
-pub struct SparseMatrix<const T: usize> {
-    pub row: [U256; T],
-    pub col: [U256; T],
+struct SparseMatrix<const T: usize> {
+    row: [U256; T],
+    col: [U256; T],
 }
 
 /// Constants required for Poseidon execution over a state of width `T`.
 ///
-/// # Layout
-/// `round_constants` holds exactly `T * full_rounds + partial_rounds` elements
-/// in Montgomery form, ordered as `T` per full round in the first half, then one
-/// per partial round, then `T` per full round in the second half.
-///
-/// The factorization follows the optimized Poseidon construction: the final full
-/// round of the first half applies `pre_sparse_matrix` in place of `mds_matrix`,
-/// and each partial round applies its own `SparseMatrix`. See
-/// [`constants`] for the default circom-compatible parameters.
+/// The fields are private, so the only instances are the generated
+/// circom-compatible parameters in [`constants`] and the permutation can rely
+/// on their layout.
 pub struct PoseidonConstants<const T: usize> {
-    pub full_rounds: usize,
-    pub partial_rounds: usize,
-    pub round_constants: &'static [U256],
-    pub mds_matrix: &'static [[U256; T]; T],
-    pub pre_sparse_matrix: &'static [[U256; T]; T],
-    pub sparse_matrices: &'static [SparseMatrix<T>],
+    full_rounds: usize,
+    partial_rounds: usize,
+    /// Exactly `T * full_rounds + partial_rounds` elements in Montgomery form,
+    /// ordered as `T` per full round in the first half, then one per partial
+    /// round, then `T` per full round in the second half.
+    round_constants: &'static [U256],
+    mds_matrix: &'static [[U256; T]; T],
+    /// The factorization follows the optimized Poseidon construction: the
+    /// final full round of the first half applies this matrix in place of
+    /// `mds_matrix`.
+    pre_sparse_matrix: &'static [[U256; T]; T],
+    /// Exactly `partial_rounds` matrices, one applied by each partial round.
+    sparse_matrices: &'static [SparseMatrix<T>],
 }
 
 /// Computes the scalar Poseidon S-box (`x^5`) using exactly 3 inlined multiplications.
@@ -375,4 +375,117 @@ fn hash_bytes<const BIG_ENDIAN: bool>(inputs: &[&[u8]]) -> Option<[u8; 32]> {
 /// big-endian digest.
 pub fn hash_be_bytes(inputs: &[&[u8]]) -> Option<[u8; 32]> {
     hash_bytes::<true>(inputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{constants::*, *};
+    use ark_bn254::Fr as ArkFr;
+    use ark_ff::{Field as _, PrimeField};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use std::{boxed::Box, vec::Vec};
+
+    /// Two full rounds isolate the pre-sparse and final dense matrices. All
+    /// expected arithmetic and Montgomery conversions use arkworks.
+    fn check_custom_matrices<const T: usize>() {
+        let radix = ArkFr::from(2u64).pow([256u64]);
+        let to_raw = |v: ArkFr| U256::new((v * radix).into_bigint().0);
+        let mds: [[ArkFr; T]; T] = core::array::from_fn(|i| {
+            core::array::from_fn(|j| -ArkFr::from((i * T + j + 1) as u64))
+        });
+        let pre_sparse: [[ArkFr; T]; T] =
+            core::array::from_fn(|i| core::array::from_fn(|j| ArkFr::from((i + 3 * j + 2) as u64)));
+        let rc: Vec<ArkFr> = (1..=2 * T).map(|i| ArkFr::from(i as u64)).collect();
+        // The parameter type requires static references, so leak each custom
+        // table.
+        let constants = PoseidonConstants {
+            full_rounds: 2,
+            partial_rounds: 0,
+            round_constants: Box::leak(
+                rc.iter()
+                    .copied()
+                    .map(to_raw)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            mds_matrix: Box::leak(Box::new(mds.map(|row| row.map(to_raw)))),
+            pre_sparse_matrix: Box::leak(Box::new(pre_sparse.map(|row| row.map(to_raw)))),
+            sparse_matrices: &[],
+        };
+        let mut rng = StdRng::seed_from_u64(0x6d61_7472_6978_7631 ^ T as u64);
+        for case in 0..12 {
+            let mut state: [ArkFr; T] = core::array::from_fn(|i| match case {
+                0 => ArkFr::from(0u64),
+                1 => ArkFr::from((i + 1) as u64),
+                2 => -ArkFr::from(1u64),
+                _ => ArkFr::from_le_bytes_mod_order(&rng.random::<[u8; 32]>()),
+            });
+            state[0] = ArkFr::from(0u64);
+            let mut expected = state;
+            for (round, matrix) in [&pre_sparse, &mds].into_iter().enumerate() {
+                for (i, value) in expected.iter_mut().enumerate() {
+                    *value = (*value + rc[round * T + i]).pow([5u64]);
+                }
+                expected = core::array::from_fn(|i| {
+                    expected.iter().zip(&matrix[i]).map(|(x, m)| *x * m).sum()
+                });
+            }
+            let state = state.map(to_raw);
+            let expected = expected.map(to_raw);
+            assert_eq!(
+                poseidon(state, &constants),
+                expected,
+                "width {T}, case {case}"
+            );
+            assert_eq!(
+                hash(&state[1..], &constants),
+                Some(expected[0]),
+                "width {T}, case {case}"
+            );
+        }
+    }
+
+    macro_rules! width_suite {
+        ($name:ident, $t:literal, $params:ident) => {
+            mod $name {
+                use super::*;
+
+                /// The permutation indexes `round_constants` linearly and panics on a
+                /// short table; pin the layout the generator promises.
+                #[test]
+                fn constant_layout() {
+                    let params: &PoseidonConstants<$t> = &$params;
+                    assert_eq!(params.full_rounds, 8);
+                    assert_eq!(
+                        params.round_constants.len(),
+                        $t * params.full_rounds + params.partial_rounds
+                    );
+                    assert_eq!(params.sparse_matrices.len(), params.partial_rounds);
+                }
+
+                #[test]
+                fn custom_matrices_match_arkworks() {
+                    check_custom_matrices::<$t>();
+                }
+            }
+        };
+    }
+
+    width_suite!(t2, 2, BN254_X5_T2);
+    width_suite!(t3, 3, BN254_X5_T3);
+    width_suite!(t4, 4, BN254_X5_T4);
+    width_suite!(t5, 5, BN254_X5_T5);
+    width_suite!(t6, 6, BN254_X5_T6);
+    width_suite!(t7, 7, BN254_X5_T7);
+    width_suite!(t8, 8, BN254_X5_T8);
+    width_suite!(t9, 9, BN254_X5_T9);
+    width_suite!(t10, 10, BN254_X5_T10);
+    width_suite!(t11, 11, BN254_X5_T11);
+    width_suite!(t12, 12, BN254_X5_T12);
+    width_suite!(t13, 13, BN254_X5_T13);
+
+    #[test]
+    fn custom_matrices_with_three_vector_chunks() {
+        check_custom_matrices::<17>();
+    }
 }

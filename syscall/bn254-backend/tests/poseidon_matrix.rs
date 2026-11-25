@@ -3,7 +3,7 @@ use light_poseidon::PoseidonParameters;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use solana_bn254_backend::backend::{Field, Fr, U256};
 use solana_bn254_backend::poseidon::constants::*;
-use solana_bn254_backend::poseidon::{PoseidonConstants, hash, poseidon};
+use solana_bn254_backend::poseidon::{PoseidonConstants, poseidon};
 
 type ArkFr = ark_bn254::Fr;
 
@@ -61,67 +61,8 @@ fn check_full_permutation<const T: usize>(constants: &PoseidonConstants<T>) {
     }
 }
 
-/// Two full rounds isolate the pre-sparse and final dense matrices. All
-/// expected arithmetic and Montgomery conversions use arkworks.
-fn check_custom_matrices<const T: usize>() {
-    let radix = ArkFr::from(2u64).pow([256u64]);
-    let to_raw = |v: ArkFr| U256::new((v * radix).into_bigint().0);
-    let mds: [[ArkFr; T]; T] =
-        core::array::from_fn(|i| core::array::from_fn(|j| -ArkFr::from((i * T + j + 1) as u64)));
-    let pre_sparse: [[ArkFr; T]; T] =
-        core::array::from_fn(|i| core::array::from_fn(|j| ArkFr::from((i + 3 * j + 2) as u64)));
-    let rc: Vec<ArkFr> = (1..=2 * T).map(|i| ArkFr::from(i as u64)).collect();
-    // The public parameter type requires static references. Allocate each
-    // custom table once per width so it can be used through that same API.
-    let constants = PoseidonConstants {
-        full_rounds: 2,
-        partial_rounds: 0,
-        round_constants: Box::leak(
-            rc.iter()
-                .copied()
-                .map(to_raw)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        ),
-        mds_matrix: Box::leak(Box::new(mds.map(|row| row.map(to_raw)))),
-        pre_sparse_matrix: Box::leak(Box::new(pre_sparse.map(|row| row.map(to_raw)))),
-        sparse_matrices: &[],
-    };
-    let mut rng = StdRng::seed_from_u64(0x6d61_7472_6978_7631 ^ T as u64);
-    for case in 0..12 {
-        let mut state: [ArkFr; T] = core::array::from_fn(|i| match case {
-            0 => ArkFr::from(0u64),
-            1 => ArkFr::from((i + 1) as u64),
-            2 => -ArkFr::from(1u64),
-            _ => seeded_value(&mut rng),
-        });
-        state[0] = ArkFr::from(0u64);
-        let mut expected = state;
-        for (round, matrix) in [&pre_sparse, &mds].into_iter().enumerate() {
-            for (i, value) in expected.iter_mut().enumerate() {
-                *value = (*value + rc[round * T + i]).pow([5u64]);
-            }
-            expected = core::array::from_fn(|i| {
-                expected.iter().zip(&matrix[i]).map(|(x, m)| *x * m).sum()
-            });
-        }
-        let state = state.map(to_raw);
-        let expected = expected.map(to_raw);
-        assert_eq!(
-            poseidon(state, &constants),
-            expected,
-            "width {T}, case {case}"
-        );
-        assert_eq!(
-            hash(&state[1..], &constants),
-            Some(expected[0]),
-            "width {T}, case {case}"
-        );
-    }
-}
-
 macro_rules! matrix_suite {
-    ($name:ident, $t:literal, $params:ident) => {
+    ($name:ident, $params:ident) => {
         mod $name {
             use super::*;
 
@@ -129,29 +70,19 @@ macro_rules! matrix_suite {
             fn full_permutation_matches_arkworks() {
                 check_full_permutation(&$params);
             }
-
-            #[test]
-            fn custom_matrices_match_arkworks() {
-                check_custom_matrices::<$t>();
-            }
         }
     };
 }
 
-matrix_suite!(t2, 2, BN254_X5_T2);
-matrix_suite!(t3, 3, BN254_X5_T3);
-matrix_suite!(t4, 4, BN254_X5_T4);
-matrix_suite!(t5, 5, BN254_X5_T5);
-matrix_suite!(t6, 6, BN254_X5_T6);
-matrix_suite!(t7, 7, BN254_X5_T7);
-matrix_suite!(t8, 8, BN254_X5_T8);
-matrix_suite!(t9, 9, BN254_X5_T9);
-matrix_suite!(t10, 10, BN254_X5_T10);
-matrix_suite!(t11, 11, BN254_X5_T11);
-matrix_suite!(t12, 12, BN254_X5_T12);
-matrix_suite!(t13, 13, BN254_X5_T13);
-
-#[test]
-fn custom_matrices_with_three_vector_chunks() {
-    check_custom_matrices::<17>();
-}
+matrix_suite!(t2, BN254_X5_T2);
+matrix_suite!(t3, BN254_X5_T3);
+matrix_suite!(t4, BN254_X5_T4);
+matrix_suite!(t5, BN254_X5_T5);
+matrix_suite!(t6, BN254_X5_T6);
+matrix_suite!(t7, BN254_X5_T7);
+matrix_suite!(t8, BN254_X5_T8);
+matrix_suite!(t9, BN254_X5_T9);
+matrix_suite!(t10, BN254_X5_T10);
+matrix_suite!(t11, BN254_X5_T11);
+matrix_suite!(t12, BN254_X5_T12);
+matrix_suite!(t13, BN254_X5_T13);

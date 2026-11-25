@@ -1,4 +1,4 @@
-//! Cross-library, known-answer, and layout tests for the Poseidon implementation.
+//! Cross-library and known-answer tests for the Poseidon implementation.
 //!
 //! The known-answer vectors carry the cross-platform guarantee. The AVX-512 IFMA
 //! path is selected by the CPU at run time, so a single machine exercises only
@@ -51,19 +51,6 @@ macro_rules! width_suite {
     ($name:ident, $t:literal, $params:ident, $kat_seq:expr, $kat_zero:expr) => {
         mod $name {
             use super::*;
-
-            /// The permutation indexes `round_constants` linearly and panics on a
-            /// short table; pin the layout the generator promises.
-            #[test]
-            fn constant_layout() {
-                let params: &PoseidonConstants<$t> = &$params;
-                assert_eq!(params.full_rounds, 8);
-                assert_eq!(
-                    params.round_constants.len(),
-                    $t * params.full_rounds + params.partial_rounds
-                );
-                assert_eq!(params.sparse_matrices.len(), params.partial_rounds);
-            }
 
             /// Cross-library check against light-poseidon's unoptimized
             /// implementation over the same parameters.
