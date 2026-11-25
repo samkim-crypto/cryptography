@@ -14,6 +14,12 @@ equal to light-poseidon's unoptimized permutation at every width, and unless the
 published circom test vectors for T = 2 and T = 3 are reproduced.
 
 Usage: generate_poseidon_constants.py <bn254_x5.rs> <out.rs> [widths...]
+
+To reproduce the checked-in file, from the repository root, with <bn254_x5.rs>
+taken from the light-poseidon version in Cargo.lock:
+python3 syscall/bn254-backend/scripts/generate_poseidon_constants.py \\
+    <bn254_x5.rs> syscall/bn254-backend/src/poseidon/constants.rs
+rustfmt --edition 2024 syscall/bn254-backend/src/poseidon/constants.rs
 """
 
 import re
@@ -254,7 +260,7 @@ HEADER = """// GENERATED FILE -- do not edit by hand.
 //! Full-round constants are light-poseidon's `ark` vectors verbatim, except the
 //! first vector of the second half, which absorbs the carry left over from
 //! folding the partial-round constants. Each partial round keeps only the
-//! state[0] component of its constant; the other components commute with the
+//! `state[0]` component of its constant; the other components commute with the
 //! S-box and are pushed forward through the MDS matrix. `pre_sparse_matrix` and
 //! `sparse_matrices` factor the MDS matrix so partial rounds cost O(T) rather
 //! than O(T^2); `pre_sparse_matrix` replaces `mds_matrix` in the final full
