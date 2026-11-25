@@ -49,6 +49,9 @@ pub struct PoseidonConstants<const T: usize> {
 }
 
 /// Computes the scalar Poseidon S-box (`x^5`) using exactly 3 inlined multiplications.
+///
+/// `x` must be a fully reduced Montgomery-form field element
+/// (`x < Fr::MODULUS`), per the `MontgomeryBackend` contract.
 #[inline(always)]
 pub fn sbox(x: &U256) -> U256 {
     type B = Backend<Fr>;
